@@ -102,6 +102,22 @@ func disable_raw() void {
     core::term_disable_raw();
 }
 
+func suspend() void {
+    disable_raw();
+    # Show cursor, exit alt screen
+    core::write_fd(1, chr(27) . "[?25h" . chr(27) . "[?1049l");
+    # Restore default SIGTSTP handler so the signal actually stops us
+    core::signal("TSTP", "DEFAULT");
+    # Send SIGTSTP to self
+    core::kill(core::getpid(), 20);
+    # When we resume (fg), re-enter raw mode and redraw
+    core::signal("TSTP", "IGNORE");
+    enable_raw();
+    core::write_fd(1, chr(27) . "[?1049h");
+    update_size();
+    render();
+}
+
 func update_size() void {
     $ROWS = core::term_rows();
     $COLS = core::term_cols();
@@ -5348,6 +5364,8 @@ func handle_key(str $key) void {
         if ($WIN_COUNT > 1) { win_other(); } else { undo_save(); insert_line($CY + 1, ""); $DIRTY = 1; }
         return;
     }
+
+    if ($key eq "C-z") { suspend(); return; }
 
     # C-_ = undo (also C-/ on most terminals)
     if ($key eq "C-_") { edit_undo(); return; }
