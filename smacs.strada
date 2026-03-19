@@ -56,6 +56,7 @@ our int $HIST_MAX;      # max entries per category
 
 our int $WHICH_FUNC;    # which-function-mode: 0=off, 1=on (default on)
 our int $FILL_COLUMN;   # fill-paragraph column width (default 70)
+our str $LAST_SEARCH;   # last isearch query
 
 our scalar $WINDOWS;    # array ref of window hashes
 our int $WIN_IDX;       # active window index
@@ -3436,6 +3437,9 @@ func cmd_isearch() void {
             next;
         }
         if ($key eq "RET" || $key eq "ESC") {
+            if (length($query) > 0) {
+                $LAST_SEARCH = $query;
+            }
             set_msg("Search done.");
             return;
         }
@@ -3448,11 +3452,17 @@ func cmd_isearch() void {
         }
         if ($key eq "C-s") {
             $dir = 1;
+            if (length($query) == 0 && length($LAST_SEARCH) > 0) {
+                $query = $LAST_SEARCH;
+            }
             search_next($query, $dir, 1);
             next;
         }
         if ($key eq "C-r") {
             $dir = -1;
+            if (length($query) == 0 && length($LAST_SEARCH) > 0) {
+                $query = $LAST_SEARCH;
+            }
             search_next($query, $dir, 1);
             next;
         }
@@ -4686,6 +4696,7 @@ func main() int {
     $HIST_MAX = 50;
     $WHICH_FUNC = 1;
     $FILL_COLUMN = 70;
+    $LAST_SEARCH = "";
 
     syn_init();
     load_config();
