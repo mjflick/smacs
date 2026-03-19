@@ -1,0 +1,4756 @@
+## smacs - a lightweight emacs-like text editor written in Strada
+## Supports: multiple buffers, incremental search, query replace,
+## replace-regexp, syntax highlighting (C, Perl, Strada), vim syntax files
+
+package main;
+
+our int $SIGWINCH_FLAG;    # set by SIGWINCH signal handler
+
+# ===========================================================================
+# Global State
+# ===========================================================================
+
+our str $E;             # ESC character
+our str $CRLF;          # carriage return
+
+our scalar $BUFFERS;    # array ref of buffer hash refs
+our int $BUF_IDX;       # current buffer index
+our scalar $CL;         # array ref: current buffer lines
+
+our int $CY;            # cursor line (0-based)
+our int $CX;            # cursor col  (0-based)
+our int $SY;            # scroll: first visible line
+our int $SX;            # scroll: first visible col
+
+our int $ROWS;          # terminal rows
+our int $COLS;          # terminal cols
+our int $EDIT_ROWS;     # rows available for editing (ROWS - 2)
+
+our int $RUNNING;       # main loop flag
+our str $MSG;           # message bar text
+our int $MSG_TIME;      # when message was set (unused, for future timeout)
+
+our str $KILL;          # kill ring (single entry)
+our int $MY;            # mark line
+our int $MX;            # mark col
+our int $MSET;          # mark active?
+
+our int $DIRTY;         # current buffer dirty flag
+our str $FNAME;         # current buffer filename
+our str $BNAME;         # current buffer name
+our str $SYNTAX;        # current buffer syntax language
+our str $MODE;          # current major mode name (e.g. "Text", "Strada", "C")
+
+our scalar $VIM_SYN;    # hash ref of loaded vim syntax defs, keyed by lang
+our scalar $SYN_KEYWORDS;   # hash ref: lang -> hash ref of keyword -> color code
+
+our scalar $UNDO;       # array ref of undo snapshots for current buffer
+our int $UNDO_MAX;      # max undo entries per buffer
+
+our int $LINUM;         # line numbers mode: 0=off, 1=on
+our int $TAB_WIDTH;     # number of spaces per tab (default 4)
+our int $INDENT_TABS;   # 0=spaces (default), 1=real tabs
+
+our scalar $HISTORY;    # hash ref: category -> array ref of past inputs
+our int $HIST_MAX;      # max entries per category
+
+our int $WHICH_FUNC;    # which-function-mode: 0=off, 1=on (default on)
+our int $FILL_COLUMN;   # fill-paragraph column width (default 70)
+
+our scalar $WINDOWS;    # array ref of window hashes
+our int $WIN_IDX;       # active window index
+our int $WIN_COUNT;     # number of windows
+
+# ===========================================================================
+# Terminal Functions
+# ===========================================================================
+
+func winch_handler() void {
+    $SIGWINCH_FLAG = 1;
+}
+
+func enable_raw() void {
+    core::term_enable_raw();
+    core::signal("WINCH", \&winch_handler);
+}
+
+func disable_raw() void {
+    core::term_disable_raw();
+}
+
+func update_size() void {
+    $ROWS = core::term_rows();
+    $COLS = core::term_cols();
+    $EDIT_ROWS = $ROWS - 2;
+    if ($EDIT_ROWS < 1) {
+        $EDIT_ROWS = 1;
+    }
+    if (defined($WINDOWS) && $WIN_COUNT > 0) {
+        win_recalc_layout();
+    }
+}
+
+func check_winch() int {
+    if ($SIGWINCH_FLAG == 1) {
+        $SIGWINCH_FLAG = 0;
+        return 1;
+    }
+    return 0;
+}
+
+# ===========================================================================
+# UTF-8 Helpers
+# ===========================================================================
+
+# Number of bytes in a UTF-8 sequence given its leading byte
+func u8_seq_len(int $b) int {
+    if ($b < 128) { return 1; }
+    if ($b < 192) { return 1; }   # continuation byte (shouldn't lead)
+    if ($b < 224) { return 2; }
+    if ($b < 240) { return 3; }
+    return 4;
+}
+
+# Advance past one UTF-8 character at byte position $pos in string $s
+func u8_next(str $s, int $pos) int {
+    my int $len = length($s);
+    if ($pos >= $len) { return $pos; }
+    my int $b = core::get_byte($s, $pos);
+    my int $n = $pos + u8_seq_len($b);
+    if ($n > $len) { $n = $len; }
+    return $n;
+}
+
+# Move back one UTF-8 character from byte position $pos
+func u8_prev(str $s, int $pos) int {
+    if ($pos <= 0) { return 0; }
+    $pos = $pos - 1;
+    # Skip continuation bytes (10xxxxxx = 0x80..0xBF)
+    while ($pos > 0) {
+        my int $b = core::get_byte($s, $pos);
+        if ($b < 128 || $b >= 192) { return $pos; }
+        $pos = $pos - 1;
+    }
+    return $pos;
+}
+
+# Is byte at $pos a UTF-8 continuation byte?
+func u8_is_cont(str $s, int $pos) int {
+    if ($pos < 0 || $pos >= length($s)) { return 0; }
+    my int $b = core::get_byte($s, $pos);
+    if ($b >= 128 && $b < 192) { return 1; }
+    return 0;
+}
+
+# Decode the UTF-8 codepoint starting at byte position $pos
+func u8_codepoint(str $s, int $pos) int {
+    my int $b = core::get_byte($s, $pos);
+    if ($b < 128) { return $b; }
+    my int $len = length($s);
+    if ($b < 224) {
+        if ($pos + 1 >= $len) { return $b; }
+        return ($b - 192) * 64 + (core::get_byte($s, $pos + 1) - 128);
+    }
+    if ($b < 240) {
+        if ($pos + 2 >= $len) { return $b; }
+        return ($b - 224) * 4096 + (core::get_byte($s, $pos + 1) - 128) * 64 + (core::get_byte($s, $pos + 2) - 128);
+    }
+    if ($pos + 3 >= $len) { return $b; }
+    return ($b - 240) * 262144 + (core::get_byte($s, $pos + 1) - 128) * 4096 + (core::get_byte($s, $pos + 2) - 128) * 64 + (core::get_byte($s, $pos + 3) - 128);
+}
+
+# Display width of the character at byte position $pos (1 or 2 for wide chars)
+func u8_char_width(str $s, int $pos) int {
+    my int $cp = u8_codepoint($s, $pos);
+    if ($cp < 128) { return 1; }
+    # CJK and wide character ranges
+    if ($cp >= 0x1100 && $cp <= 0x115F) { return 2; }
+    if ($cp >= 0x2E80 && $cp <= 0xA4CF) { return 2; }
+    if ($cp >= 0xAC00 && $cp <= 0xD7A3) { return 2; }
+    if ($cp >= 0xF900 && $cp <= 0xFAFF) { return 2; }
+    if ($cp >= 0xFE10 && $cp <= 0xFE6F) { return 2; }
+    if ($cp >= 0xFF01 && $cp <= 0xFF60) { return 2; }
+    if ($cp >= 0xFFE0 && $cp <= 0xFFE6) { return 2; }
+    if ($cp >= 0x20000 && $cp <= 0x3134F) { return 2; }
+    if ($cp >= 0x1F300 && $cp <= 0x1F9FF) { return 2; }
+    return 1;
+}
+
+# Display width of a string (accounts for multi-byte and wide chars)
+func u8_str_width(str $s) int {
+    my int $w = 0;
+    my int $pos = 0;
+    my int $len = length($s);
+    while ($pos < $len) {
+        $w = $w + u8_char_width($s, $pos);
+        $pos = u8_next($s, $pos);
+    }
+    return $w;
+}
+
+# Convert byte position to display column
+func u8_byte_to_col(str $s, int $byte_pos) int {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < $byte_pos && $pos < length($s)) {
+        $col = $col + u8_char_width($s, $pos);
+        $pos = u8_next($s, $pos);
+    }
+    return $col;
+}
+
+# Convert display column to byte position (returns byte pos of char at or after target col)
+func u8_col_to_byte(str $s, int $target_col) int {
+    my int $col = 0;
+    my int $pos = 0;
+    my int $len = length($s);
+    while ($pos < $len && $col < $target_col) {
+        $col = $col + u8_char_width($s, $pos);
+        $pos = u8_next($s, $pos);
+    }
+    return $pos;
+}
+
+# Truncate string to fit within max_cols display columns
+func u8_truncate(str $s, int $max_cols) str {
+    my int $col = 0;
+    my int $pos = 0;
+    my int $len = length($s);
+    while ($pos < $len) {
+        my int $w = u8_char_width($s, $pos);
+        if ($col + $w > $max_cols) {
+            return substr($s, 0, $pos);
+        }
+        $col = $col + $w;
+        $pos = u8_next($s, $pos);
+    }
+    return $s;
+}
+
+# Skip $skip_cols display columns from start of $s, return remaining string
+func u8_skip_cols(str $s, int $skip_cols) str {
+    my int $col = 0;
+    my int $pos = 0;
+    my int $len = length($s);
+    while ($pos < $len && $col < $skip_cols) {
+        $col = $col + u8_char_width($s, $pos);
+        $pos = u8_next($s, $pos);
+    }
+    if ($pos >= $len) { return ""; }
+    return substr($s, $pos);
+}
+
+# ===========================================================================
+# Key Reading
+# ===========================================================================
+
+func read_byte() int {
+    return core::read_byte(0);
+}
+
+func read_key() str {
+    my int $c = read_byte();
+    if ($c == -1) {
+        return "";
+    }
+
+    # C-Space / C-@ (NUL byte)
+    if ($c == 0) {
+        return "C- ";
+    }
+    # Enter
+    if ($c == 13) {
+        return "RET";
+    }
+    # Tab
+    if ($c == 9) {
+        return "TAB";
+    }
+    # Backspace
+    if ($c == 127) {
+        return "BACKSPACE";
+    }
+    # Ctrl keys: C-a(1) through C-z(26), except TAB(9) and RET(13)
+    if ($c >= 1 && $c <= 26) {
+        return "C-" . chr($c + 96);
+    }
+    # C-_ (undo) - byte 31; C-/ also sends 31 on most terminals
+    if ($c == 31) {
+        return "C-_";
+    }
+    # ESC
+    if ($c == 27) {
+        my int $c2 = read_byte();
+        if ($c2 == -1) {
+            return "ESC";
+        }
+        if ($c2 == 91) {
+            # CSI sequence: ESC [
+            my int $c3 = read_byte();
+            if ($c3 == -1) {
+                return "ESC";
+            }
+            if ($c3 == 65) { return "UP"; }
+            if ($c3 == 66) { return "DOWN"; }
+            if ($c3 == 67) { return "RIGHT"; }
+            if ($c3 == 68) { return "LEFT"; }
+            if ($c3 == 72) { return "HOME"; }
+            if ($c3 == 70) { return "END"; }
+            # Extended sequences: ESC [ N ~
+            if ($c3 >= 49 && $c3 <= 54) {
+                my int $c4 = read_byte();
+                if ($c4 == 126) {
+                    if ($c3 == 49) { return "HOME"; }
+                    if ($c3 == 51) { return "DEL"; }
+                    if ($c3 == 52) { return "END"; }
+                    if ($c3 == 53) { return "PGUP"; }
+                    if ($c3 == 54) { return "PGDN"; }
+                }
+                # Consume any remaining bytes
+                return "ESC";
+            }
+            return "ESC";
+        }
+        # Alt+Backspace (ESC + DEL)
+        if ($c2 == 127) {
+            return "M-BACKSPACE";
+        }
+        # Alt/Meta: ESC followed by char
+        if ($c2 >= 32 && $c2 <= 126) {
+            return "M-" . chr($c2);
+        }
+        return "ESC";
+    }
+    # Printable characters
+    if ($c >= 32 && $c <= 126) {
+        return chr($c);
+    }
+    # UTF-8 multi-byte: read full sequence
+    if ($c >= 128) {
+        my int $seq_len = u8_seq_len($c);
+        my str $result = chr($c);
+        my int $bi = 1;
+        while ($bi < $seq_len) {
+            my int $nb = read_byte();
+            if ($nb < 0) { return $result; }
+            $result = $result . chr($nb);
+            $bi = $bi + 1;
+        }
+        return $result;
+    }
+    return "";
+}
+
+# ===========================================================================
+# Major Modes
+# ===========================================================================
+
+# Map a syntax language string to its mode name
+func mode_for_syntax(str $syn) str {
+    if ($syn eq "c") { return "C"; }
+    if ($syn eq "perl") { return "Perl"; }
+    if ($syn eq "strada") { return "Strada"; }
+    if ($syn eq "python") { return "Python"; }
+    if ($syn eq "javascript" || $syn eq "js") { return "JavaScript"; }
+    if ($syn eq "html") { return "HTML"; }
+    if ($syn eq "css") { return "CSS"; }
+    if ($syn eq "shell" || $syn eq "sh" || $syn eq "bash") { return "Shell"; }
+    if ($syn eq "makefile") { return "Makefile"; }
+    if ($syn eq "markdown" || $syn eq "md") { return "Markdown"; }
+    return "Text";
+}
+
+# Map a mode name to its syntax language string (for highlighting)
+func syntax_for_mode(str $mode) str {
+    if ($mode eq "C") { return "c"; }
+    if ($mode eq "Perl") { return "perl"; }
+    if ($mode eq "Strada") { return "strada"; }
+    if ($mode eq "Python") { return "python"; }
+    if ($mode eq "JavaScript") { return "javascript"; }
+    if ($mode eq "HTML") { return "html"; }
+    if ($mode eq "CSS") { return "css"; }
+    if ($mode eq "Shell") { return "shell"; }
+    if ($mode eq "Makefile") { return "makefile"; }
+    if ($mode eq "Markdown") { return "markdown"; }
+    return "";
+}
+
+# Set the current buffer's major mode
+func set_mode(str $mode) void {
+    $MODE = $mode;
+    $SYNTAX = syntax_for_mode($mode);
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"mode"} = $MODE;
+    $buf->{"syntax"} = $SYNTAX;
+    set_msg($mode . " mode");
+}
+
+# ===========================================================================
+# Buffer Management
+# ===========================================================================
+
+func buf_new(str $name, str $filename) void {
+    my scalar $buf = {};
+    $buf->{"name"} = $name;
+    $buf->{"filename"} = $filename;
+    $buf->{"lines"} = [""];
+    $buf->{"cy"} = 0;
+    $buf->{"cx"} = 0;
+    $buf->{"sy"} = 0;
+    $buf->{"sx"} = 0;
+    $buf->{"dirty"} = 0;
+    $buf->{"syntax"} = syn_detect($filename);
+    $buf->{"mode"} = mode_for_syntax(syn_detect($filename));
+    $buf->{"undo"} = [];
+    push(@$BUFFERS, $buf);
+}
+
+func buf_save_state() void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"cy"} = $CY;
+    $buf->{"cx"} = $CX;
+    $buf->{"sy"} = $SY;
+    $buf->{"sx"} = $SX;
+    $buf->{"dirty"} = $DIRTY;
+    $buf->{"filename"} = $FNAME;
+    $buf->{"name"} = $BNAME;
+    $buf->{"syntax"} = $SYNTAX;
+    $buf->{"mode"} = $MODE;
+    $buf->{"undo"} = $UNDO;
+}
+
+func buf_load_state(int $idx) void {
+    my scalar $buf = $BUFFERS->[$idx];
+    $BUF_IDX = $idx;
+    $CL = $buf->{"lines"};
+    $CY = $buf->{"cy"};
+    $CX = $buf->{"cx"};
+    $SY = $buf->{"sy"};
+    $SX = $buf->{"sx"};
+    $DIRTY = $buf->{"dirty"};
+    $FNAME = $buf->{"filename"};
+    $BNAME = $buf->{"name"};
+    $SYNTAX = $buf->{"syntax"};
+    $MODE = $buf->{"mode"};
+    $UNDO = $buf->{"undo"};
+    if (!defined($UNDO)) {
+        $UNDO = [];
+    }
+    if (length($MODE) == 0) {
+        $MODE = "Text";
+    }
+}
+
+func buf_count() int {
+    return scalar(@$BUFFERS);
+}
+
+func buf_find(str $name) int {
+    my int $i = 0;
+    while ($i < scalar(@$BUFFERS)) {
+        my scalar $b = $BUFFERS->[$i];
+        if ($b->{"name"} eq $name) {
+            return $i;
+        }
+        $i = $i + 1;
+    }
+    return -1;
+}
+
+# ===========================================================================
+# Window Management
+# ===========================================================================
+
+func win_make(int $buf_idx, int $top, int $height, int $left, int $width) scalar {
+    my scalar $w = {};
+    $w->{"buf_idx"} = $buf_idx;
+    $w->{"top_row"} = $top;
+    $w->{"height"} = $height;
+    $w->{"left_col"} = $left;
+    $w->{"width"} = $width;
+    return $w;
+}
+
+func win_init() void {
+    $WINDOWS = [];
+    push(@$WINDOWS, win_make($BUF_IDX, 0, $EDIT_ROWS, 0, $COLS));
+    $WIN_IDX = 0;
+    $WIN_COUNT = 1;
+}
+
+func win_save_state() void {
+    my scalar $w = $WINDOWS->[$WIN_IDX];
+    $w->{"buf_idx"} = $BUF_IDX;
+    $w->{"cy"} = $CY;
+    $w->{"cx"} = $CX;
+    $w->{"sy"} = $SY;
+    $w->{"sx"} = $SX;
+}
+
+func win_load_state(int $idx) void {
+    my scalar $w = $WINDOWS->[$idx];
+    # Save current buffer state back
+    buf_save_state();
+    $WIN_IDX = $idx;
+    my int $bi = $w->{"buf_idx"};
+    # Always load the target buffer (even if same index, the window
+    # may have different cursor/scroll state)
+    buf_load_state($bi);
+    # Restore per-window cursor/scroll (overrides buffer defaults)
+    if (defined($w->{"cy"})) {
+        $CY = $w->{"cy"};
+        $CX = $w->{"cx"};
+        $SY = $w->{"sy"};
+        $SX = $w->{"sx"};
+    }
+}
+
+func win_recalc_layout() void {
+    # For a single window, take the full screen
+    if ($WIN_COUNT == 1) {
+        my scalar $w = $WINDOWS->[0];
+        $w->{"top_row"} = 0;
+        $w->{"height"} = $EDIT_ROWS;
+        $w->{"left_col"} = 0;
+        $w->{"width"} = $COLS;
+        return;
+    }
+    # For multiple windows, scale each window proportionally to the new terminal size.
+    # Preserve relative positions: compute fraction of old size and map to new.
+    # Simple approach: just recalculate based on current geometry constraints.
+    # Each window keeps its position ratios. For now, re-distribute evenly
+    # based on whether windows share rows (vertical) or columns (horizontal).
+    # We detect layout by checking if any two windows share the same top_row.
+    my int $has_vsplit = 0;
+    my int $i = 0;
+    while ($i < $WIN_COUNT) {
+        my int $j = $i + 1;
+        while ($j < $WIN_COUNT) {
+            my scalar $wi2 = $WINDOWS->[$i];
+            my scalar $wj2 = $WINDOWS->[$j];
+            if ($wi2->{"top_row"} == $wj2->{"top_row"}) {
+                $has_vsplit = 1;
+            }
+            $j = $j + 1;
+        }
+        $i = $i + 1;
+    }
+    if ($has_vsplit == 0) {
+        # All horizontal splits: redistribute heights
+        my int $avail = $ROWS - 1 - $WIN_COUNT;
+        if ($avail < $WIN_COUNT) { $avail = $WIN_COUNT; }
+        my int $per = $avail / $WIN_COUNT;
+        if ($per < 1) { $per = 1; }
+        my int $row = 0;
+        $i = 0;
+        while ($i < $WIN_COUNT) {
+            my scalar $w = $WINDOWS->[$i];
+            $w->{"top_row"} = $row;
+            $w->{"left_col"} = 0;
+            $w->{"width"} = $COLS;
+            if ($i == $WIN_COUNT - 1) {
+                $w->{"height"} = $avail - $row;
+            } else {
+                $w->{"height"} = $per;
+            }
+            if ($w->{"height"} < 1) { $w->{"height"} = 1; }
+            $row = $row + $w->{"height"} + 1;
+            $i = $i + 1;
+        }
+    } else {
+        # Has vertical splits: recalculate proportionally
+        # Group windows by top_row, redistribute widths within each group
+        $i = 0;
+        while ($i < $WIN_COUNT) {
+            my scalar $w = $WINDOWS->[$i];
+            # Count windows in this row group
+            my int $row_top = $w->{"top_row"};
+            my int $group_count = 0;
+            my int $k = 0;
+            while ($k < $WIN_COUNT) {
+                my scalar $wk = $WINDOWS->[$k];
+                if ($wk->{"top_row"} == $row_top) {
+                    $group_count = $group_count + 1;
+                }
+                $k = $k + 1;
+            }
+            if ($group_count > 1) {
+                # Redistribute widths: each gets COLS/group_count, minus 1 for separators
+                my int $avail_w = $COLS - ($group_count - 1);
+                my int $per_w = $avail_w / $group_count;
+                if ($per_w < 4) { $per_w = 4; }
+                my int $col = 0;
+                my int $gi = 0;
+                $k = 0;
+                while ($k < $WIN_COUNT) {
+                    my scalar $wk2 = $WINDOWS->[$k];
+                    if ($wk2->{"top_row"} == $row_top) {
+                        $wk2->{"left_col"} = $col;
+                        if ($gi == $group_count - 1) {
+                            $wk2->{"width"} = $COLS - $col;
+                        } else {
+                            $wk2->{"width"} = $per_w;
+                        }
+                        $col = $col + $wk2->{"width"} + 1;
+                        $gi = $gi + 1;
+                    }
+                    $k = $k + 1;
+                }
+            } else {
+                $w->{"left_col"} = 0;
+                $w->{"width"} = $COLS;
+            }
+            $i = $i + 1;
+        }
+        # Also redistribute heights for horizontal groups
+        # Find unique top_rows and redistribute
+        my int $avail_h = $ROWS - 1;
+        # Count unique row groups
+        my int $num_groups = 0;
+        my scalar $seen_rows = {};
+        $i = 0;
+        while ($i < $WIN_COUNT) {
+            my scalar $w2 = $WINDOWS->[$i];
+            my str $rk = "" . $w2->{"top_row"};
+            if (length("" . $seen_rows->{$rk}) == 0) {
+                $seen_rows->{$rk} = "1";
+                $num_groups = $num_groups + 1;
+            }
+            $i = $i + 1;
+        }
+        my int $per_h = ($avail_h - $num_groups) / $num_groups;
+        if ($per_h < 1) { $per_h = 1; }
+        my int $row = 0;
+        my int $group_idx = 0;
+        $seen_rows = {};
+        $i = 0;
+        while ($i < $WIN_COUNT) {
+            my scalar $w3 = $WINDOWS->[$i];
+            my str $rk2 = "" . $w3->{"top_row"};
+            if (length("" . $seen_rows->{$rk2}) == 0) {
+                $seen_rows->{$rk2} = "1";
+                my int $gh = $per_h;
+                if ($group_idx == $num_groups - 1) {
+                    $gh = $avail_h - $num_groups - $row;
+                }
+                if ($gh < 1) { $gh = 1; }
+                # Set all windows in this group to same top_row and height
+                my int $m = 0;
+                while ($m < $WIN_COUNT) {
+                    my scalar $wm = $WINDOWS->[$m];
+                    if ("" . $wm->{"top_row"} eq $rk2) {
+                        $wm->{"top_row"} = $row;
+                        $wm->{"height"} = $gh;
+                    }
+                    $m = $m + 1;
+                }
+                $row = $row + $gh + 1;
+                $group_idx = $group_idx + 1;
+            }
+            $i = $i + 1;
+        }
+    }
+}
+
+func win_split() void {
+    my scalar $cur = $WINDOWS->[$WIN_IDX];
+    my int $h = $cur->{"height"};
+    if ($h < 4) {
+        set_msg("Window too small to split.");
+        return;
+    }
+    buf_save_state();
+
+    # Split horizontally: current window keeps top half, new gets bottom
+    my int $top_h = ($h - 1) / 2;  # -1 for separator status bar
+    if ($top_h < 1) { $top_h = 1; }
+    my int $bot_h = $h - $top_h - 1;
+    if ($bot_h < 1) { $bot_h = 1; }
+
+    my int $top = $cur->{"top_row"};
+    my int $left = $cur->{"left_col"};
+    my int $width = $cur->{"width"};
+
+    $cur->{"height"} = $top_h;
+
+    # If multiple buffers exist, show next buffer in new window
+    my int $new_buf = $BUF_IDX;
+    if (buf_count() > 1) {
+        $new_buf = $BUF_IDX + 1;
+        if ($new_buf >= buf_count()) { $new_buf = 0; }
+    }
+    my scalar $nw = win_make($new_buf, $top + $top_h + 1, $bot_h, $left, $width);
+    # Set cursor state for new window
+    if ($new_buf == $BUF_IDX) {
+        $nw->{"cy"} = $CY;
+        $nw->{"cx"} = $CX;
+        $nw->{"sy"} = $SY;
+        $nw->{"sx"} = $SX;
+    } else {
+        my scalar $nbuf = $BUFFERS->[$new_buf];
+        $nw->{"cy"} = $nbuf->{"cy"};
+        $nw->{"cx"} = $nbuf->{"cx"};
+        $nw->{"sy"} = $nbuf->{"sy"};
+        $nw->{"sx"} = $nbuf->{"sx"};
+    }
+    # Save current window's cursor state
+    $cur->{"cy"} = $CY;
+    $cur->{"cx"} = $CX;
+    $cur->{"sy"} = $SY;
+    $cur->{"sx"} = $SX;
+
+    # Insert after current window
+    my scalar $new_wins = [];
+    my int $i = 0;
+    while ($i < $WIN_COUNT) {
+        push(@$new_wins, $WINDOWS->[$i]);
+        if ($i == $WIN_IDX) {
+            push(@$new_wins, $nw);
+        }
+        $i = $i + 1;
+    }
+    $WINDOWS = $new_wins;
+    $WIN_COUNT = $WIN_COUNT + 1;
+    set_msg("Split.");
+}
+
+func win_split_vertical() void {
+    my scalar $cur = $WINDOWS->[$WIN_IDX];
+    my int $w = $cur->{"width"};
+    if ($w < 10) {
+        set_msg("Window too narrow to split.");
+        return;
+    }
+    buf_save_state();
+
+    # Split vertically: current keeps left half, new gets right
+    my int $left_w = ($w - 1) / 2;  # -1 for separator column
+    if ($left_w < 4) { $left_w = 4; }
+    my int $right_w = $w - $left_w - 1;
+    if ($right_w < 4) { $right_w = 4; }
+
+    my int $top = $cur->{"top_row"};
+    my int $height = $cur->{"height"};
+    my int $left = $cur->{"left_col"};
+
+    $cur->{"width"} = $left_w;
+
+    # If multiple buffers exist, show next buffer in new window
+    my int $new_buf = $BUF_IDX;
+    if (buf_count() > 1) {
+        $new_buf = $BUF_IDX + 1;
+        if ($new_buf >= buf_count()) { $new_buf = 0; }
+    }
+    my scalar $nw = win_make($new_buf, $top, $height, $left + $left_w + 1, $right_w);
+    # Set cursor state for new window
+    if ($new_buf == $BUF_IDX) {
+        $nw->{"cy"} = $CY;
+        $nw->{"cx"} = $CX;
+        $nw->{"sy"} = $SY;
+        $nw->{"sx"} = $SX;
+    } else {
+        my scalar $nbuf = $BUFFERS->[$new_buf];
+        $nw->{"cy"} = $nbuf->{"cy"};
+        $nw->{"cx"} = $nbuf->{"cx"};
+        $nw->{"sy"} = $nbuf->{"sy"};
+        $nw->{"sx"} = $nbuf->{"sx"};
+    }
+    # Save current window's cursor state
+    $cur->{"cy"} = $CY;
+    $cur->{"cx"} = $CX;
+    $cur->{"sy"} = $SY;
+    $cur->{"sx"} = $SX;
+
+    my scalar $new_wins = [];
+    my int $i = 0;
+    while ($i < $WIN_COUNT) {
+        push(@$new_wins, $WINDOWS->[$i]);
+        if ($i == $WIN_IDX) {
+            push(@$new_wins, $nw);
+        }
+        $i = $i + 1;
+    }
+    $WINDOWS = $new_wins;
+    $WIN_COUNT = $WIN_COUNT + 1;
+    set_msg("Split vertically.");
+}
+
+func win_delete_others() void {
+    if ($WIN_COUNT <= 1) {
+        set_msg("No other windows.");
+        return;
+    }
+    buf_save_state();
+    my scalar $keep = $WINDOWS->[$WIN_IDX];
+    $keep->{"top_row"} = 0;
+    $keep->{"height"} = $EDIT_ROWS;
+    $keep->{"left_col"} = 0;
+    $keep->{"width"} = $COLS;
+    $WINDOWS = [];
+    push(@$WINDOWS, $keep);
+    $WIN_COUNT = 1;
+    $WIN_IDX = 0;
+    set_msg("Deleted other windows.");
+}
+
+func win_other() void {
+    if ($WIN_COUNT <= 1) {
+        set_msg("No other window.");
+        return;
+    }
+    buf_save_state();
+    win_save_state();
+    my int $next = $WIN_IDX + 1;
+    if ($next >= $WIN_COUNT) { $next = 0; }
+    win_load_state($next);
+    set_msg("Window: " . ($WIN_IDX + 1) . "/" . $WIN_COUNT);
+}
+
+func buf_switch(str $name) void {
+    my int $idx = buf_find($name);
+    if ($idx == -1) {
+        set_msg("No buffer named: " . $name);
+        return;
+    }
+    buf_save_state();
+    win_save_state();
+    buf_load_state($idx);
+    # Update the current window to track the new buffer
+    my scalar $w = $WINDOWS->[$WIN_IDX];
+    $w->{"buf_idx"} = $BUF_IDX;
+}
+
+func buf_names() str {
+    my str $out = "";
+    my int $i = 0;
+    while ($i < scalar(@$BUFFERS)) {
+        my scalar $b = $BUFFERS->[$i];
+        if ($i > 0) {
+            $out = $out . ", ";
+        }
+        $out = $out . $b->{"name"};
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+func line_count() int {
+    return scalar(@$CL);
+}
+
+func get_line(int $n) str {
+    if ($n < 0 || $n >= scalar(@$CL)) {
+        return "";
+    }
+    return $CL->[$n];
+}
+
+func set_line(int $n, str $val) void {
+    if ($n >= 0 && $n < scalar(@$CL)) {
+        $CL->[$n] = $val;
+    }
+}
+
+func insert_line(int $at, str $val) void {
+    splice(@$CL, $at, 0, $val);
+}
+
+func delete_line(int $at) void {
+    if (scalar(@$CL) > 1) {
+        splice(@$CL, $at, 1);
+    }
+}
+
+# ===========================================================================
+# Message Bar
+# ===========================================================================
+
+func set_msg(str $text) void {
+    $MSG = $text;
+}
+
+# ===========================================================================
+# File I/O
+# ===========================================================================
+
+func file_open(str $path) void {
+    my scalar $fh = core::open($path, "r");
+    if (!defined($fh)) {
+        set_msg("Cannot open: " . $path);
+        return;
+    }
+    # Clear current lines
+    my scalar $lines = [];
+    my str $line = <$fh>;
+    while (defined($line)) {
+        push(@$lines, $line);
+        $line = <$fh>;
+    }
+    core::close($fh);
+    if (scalar(@$lines) == 0) {
+        push(@$lines, "");
+    }
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"lines"} = $lines;
+    $CL = $lines;
+    $CY = 0;
+    $CX = 0;
+    $SY = 0;
+    $SX = 0;
+    $DIRTY = 0;
+    # Extract basename for buffer name
+    my str $bname = $path;
+    my int $slash = 0;
+    my int $si = 0;
+    while ($si < length($path)) {
+        if (substr($path, $si, 1) eq "/") {
+            $slash = $si;
+        }
+        $si = $si + 1;
+    }
+    if (substr($path, $slash, 1) eq "/") {
+        $bname = substr($path, $slash + 1);
+    }
+    $BNAME = $bname;
+    $FNAME = $path;
+    $SYNTAX = syn_detect($path);
+    $MODE = mode_for_syntax($SYNTAX);
+    my scalar $b2 = $BUFFERS->[$BUF_IDX];
+    $b2->{"name"} = $bname;
+    $b2->{"mode"} = $MODE;
+    $b2->{"filename"} = $path;
+    $b2->{"syntax"} = $SYNTAX;
+    set_msg("Opened: " . $path);
+}
+
+func file_save() void {
+    if (length($FNAME) == 0) {
+        my str $path = mb_read("Save as: ");
+        if (length($path) == 0) {
+            set_msg("Save cancelled.");
+            return;
+        }
+        $FNAME = $path;
+    }
+    my scalar $fh = core::open($FNAME, "w");
+    if (!defined($fh)) {
+        set_msg("Cannot write: " . $FNAME);
+        return;
+    }
+    my int $i = 0;
+    my int $n = line_count();
+    while ($i < $n) {
+        say($fh, get_line($i));
+        $i = $i + 1;
+    }
+    core::close($fh);
+    $DIRTY = 0;
+    set_msg("Wrote " . $n . " lines to " . $FNAME);
+}
+
+# ===========================================================================
+# Config File Support
+# ===========================================================================
+
+# Parse a config file with key=value pairs (lines starting with # are comments)
+func load_config_file(str $path) void {
+    my scalar $fh = core::open($path, "r");
+    if (!defined($fh)) { return; }
+
+    my str $line = <$fh>;
+    while (defined($line)) {
+        # Skip empty lines and comments
+        if (length($line) > 0 && substr($line, 0, 1) ne "#") {
+            # Find = sign
+            my int $eq = index($line, "=");
+            if ($eq > 0) {
+                my str $key = substr($line, 0, $eq);
+                my str $val = substr($line, $eq + 1);
+
+                # Trim spaces from key and value
+                while (length($key) > 0 && substr($key, 0, 1) eq " ") {
+                    $key = substr($key, 1);
+                }
+                while (length($key) > 0 && substr($key, length($key) - 1, 1) eq " ") {
+                    $key = substr($key, 0, length($key) - 1);
+                }
+                while (length($val) > 0 && substr($val, 0, 1) eq " ") {
+                    $val = substr($val, 1);
+                }
+                while (length($val) > 0 && substr($val, length($val) - 1, 1) eq " ") {
+                    $val = substr($val, 0, length($val) - 1);
+                }
+
+                if ($key eq "line-numbers") {
+                    if ($val eq "on" || $val eq "true" || $val eq "1") {
+                        $LINUM = 1;
+                    } else {
+                        $LINUM = 0;
+                    }
+                } elsif ($key eq "syntax") {
+                    $SYNTAX = $val;
+                } elsif ($key eq "undo-max") {
+                    my int $n = core::atoi($val);
+                    if ($n > 0) { $UNDO_MAX = $n; }
+                } elsif ($key eq "vim-syntax") {
+                    vim_syntax_load($val);
+                } elsif ($key eq "tab-width") {
+                    my int $tw = core::atoi($val);
+                    if ($tw > 0 && $tw <= 16) { $TAB_WIDTH = $tw; }
+                } elsif ($key eq "indent-tabs-mode") {
+                    if ($val eq "on" || $val eq "true" || $val eq "1" || $val eq "tabs") {
+                        $INDENT_TABS = 1;
+                    } else {
+                        $INDENT_TABS = 0;
+                    }
+                } elsif ($key eq "fill-column") {
+                    my int $fc = core::atoi($val);
+                    if ($fc > 0 && $fc <= 1000) { $FILL_COLUMN = $fc; }
+                } elsif ($key eq "which-function-mode") {
+                    if ($val eq "on" || $val eq "true" || $val eq "1") {
+                        $WHICH_FUNC = 1;
+                    } else {
+                        $WHICH_FUNC = 0;
+                    }
+                }
+            }
+        }
+        $line = <$fh>;
+    }
+    core::close($fh);
+}
+
+func load_config() void {
+    # System config
+    load_config_file("/etc/smacsrc");
+
+    # User config: ~/.smacsrc
+    my str $home = core::getenv("HOME");
+    if (length($home) > 0) {
+        load_config_file($home . "/.smacsrc");
+    }
+}
+
+# ===========================================================================
+# Syntax Highlighting
+# ===========================================================================
+
+func syn_init() void {
+    $SYN_KEYWORDS = {};
+
+    # -- C keywords --
+    my scalar $ckw = {};
+    my str $c_kw = "auto break case const continue default do else enum extern for goto if inline register restrict return sizeof static struct switch typedef union unsigned volatile while";
+    my str $c_types = "void int char short long float double signed size_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t FILE";
+    my str $c_preproc = "#include #define #ifdef #ifndef #endif #else #elif #pragma #undef #if #error #warning";
+
+    my array @kw = split(" ", $c_kw);
+    my int $i = 0;
+    while ($i < scalar(@kw)) {
+        $ckw->{$kw[$i]} = "33";
+        $i = $i + 1;
+    }
+    my array @ty = split(" ", $c_types);
+    $i = 0;
+    while ($i < scalar(@ty)) {
+        $ckw->{$ty[$i]} = "36";
+        $i = $i + 1;
+    }
+    my array @pp = split(" ", $c_preproc);
+    $i = 0;
+    while ($i < scalar(@pp)) {
+        $ckw->{$pp[$i]} = "34";
+        $i = $i + 1;
+    }
+    $SYN_KEYWORDS->{"c"} = $ckw;
+
+    # -- Perl keywords --
+    my scalar $pkw = {};
+    my str $p_kw = "my our local sub use require if elsif else unless while until for foreach return last next redo die warn print say push pop shift unshift chomp chop split join grep map sort keys values exists delete defined ref bless package qw BEGIN END eval do";
+    my str $p_types = "scalar array hash int str";
+
+    my array @pk = split(" ", $p_kw);
+    $i = 0;
+    while ($i < scalar(@pk)) {
+        $pkw->{$pk[$i]} = "33";
+        $i = $i + 1;
+    }
+    my array @pt = split(" ", $p_types);
+    $i = 0;
+    while ($i < scalar(@pt)) {
+        $pkw->{$pt[$i]} = "36";
+        $i = $i + 1;
+    }
+    $SYN_KEYWORDS->{"perl"} = $pkw;
+
+    # -- Strada keywords --
+    my scalar $skw = {};
+    my str $s_kw = "func fn my our if elsif else unless while until for foreach return last next redo die warn say print push pop shift unshift split join keys values exists delete defined package use import_lib import_object import_archive has ro rw extends with before after around try catch throw async await const enum private BEGIN END bless";
+    my str $s_types = "int num str scalar array hash void dynamic int8 int16 uint8 byte uint16 uint32 uint64 size_t char float double";
+    my str $s_special = "__C__ __PACKAGE__ __FILE__ __LINE__";
+
+    my array @sk = split(" ", $s_kw);
+    $i = 0;
+    while ($i < scalar(@sk)) {
+        $skw->{$sk[$i]} = "33";
+        $i = $i + 1;
+    }
+    my array @st = split(" ", $s_types);
+    $i = 0;
+    while ($i < scalar(@st)) {
+        $skw->{$st[$i]} = "36";
+        $i = $i + 1;
+    }
+    my array @ss = split(" ", $s_special);
+    $i = 0;
+    while ($i < scalar(@ss)) {
+        $skw->{$ss[$i]} = "35;1";
+        $i = $i + 1;
+    }
+    $SYN_KEYWORDS->{"strada"} = $skw;
+}
+
+func syn_detect(str $filename) str {
+    if (length($filename) == 0) {
+        return "";
+    }
+    # Check basename for extensionless files (e.g. Makefile)
+    my int $last_slash = -1;
+    my int $si = 0;
+    while ($si < length($filename)) {
+        if (substr($filename, $si, 1) eq "/") { $last_slash = $si; }
+        $si = $si + 1;
+    }
+    my str $basename = $filename;
+    if ($last_slash >= 0) { $basename = substr($filename, $last_slash + 1); }
+    if ($basename eq "Makefile" || $basename eq "makefile" || $basename eq "GNUmakefile") {
+        return "makefile";
+    }
+
+    my int $dot = -1;
+    my int $i = length($filename) - 1;
+    while ($i >= 0) {
+        if (substr($filename, $i, 1) eq ".") {
+            $dot = $i;
+            last;
+        }
+        $i = $i - 1;
+    }
+    if ($dot == -1) {
+        return "";
+    }
+    my str $ext = substr($filename, $dot + 1);
+    if ($ext eq "c" || $ext eq "h") {
+        return "c";
+    }
+    if ($ext eq "pl" || $ext eq "pm" || $ext eq "t") {
+        return "perl";
+    }
+    if ($ext eq "strada" || $ext eq "st") {
+        return "strada";
+    }
+    if ($ext eq "py") {
+        return "python";
+    }
+    if ($ext eq "js") {
+        return "javascript";
+    }
+    if ($ext eq "html" || $ext eq "htm") {
+        return "html";
+    }
+    if ($ext eq "css") {
+        return "css";
+    }
+    if ($ext eq "sh" || $ext eq "bash") {
+        return "shell";
+    }
+    if ($ext eq "md" || $ext eq "markdown") {
+        return "markdown";
+    }
+    return "";
+}
+
+func is_word_char(str $ch) int {
+    if (length($ch) == 0) { return 0; }
+    my int $code = ord($ch);
+    if ($code >= 97 && $code <= 122) { return 1; }
+    if ($code >= 65 && $code <= 90) { return 1; }
+    if ($code >= 48 && $code <= 57) { return 1; }
+    if ($code == 95) { return 1; }
+    # Multi-byte UTF-8 chars (accented letters, CJK, etc.) are word chars
+    if ($code >= 128) { return 1; }
+    return 0;
+}
+
+# Extract a single UTF-8 character from string at byte position
+func u8_char_at(str $s, int $pos) str {
+    my int $len = length($s);
+    if ($pos >= $len) { return ""; }
+    my int $next = u8_next($s, $pos);
+    return substr($s, $pos, $next - $pos);
+}
+
+func is_digit(str $ch) int {
+    if (length($ch) == 0) { return 0; }
+    my int $code = ord($ch);
+    return ($code >= 48 && $code <= 57);
+}
+
+func highlight_line(str $line, str $lang) str {
+    if (length($lang) == 0 || !defined($SYN_KEYWORDS)) {
+        return $line;
+    }
+
+    # Check for vim syntax first
+    if (defined($VIM_SYN)) {
+        my str $vresult = vim_highlight($line, $lang);
+        if (length($vresult) > 0) {
+            return $vresult;
+        }
+    }
+
+    my scalar $kw_map = $SYN_KEYWORDS->{$lang};
+    if (!defined($kw_map)) {
+        return $line;
+    }
+
+    my str $reset = $E . "[0m";
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($line);
+    my int $in_str = 0;
+    my int $in_char = 0;
+
+    while ($i < $len) {
+        my str $ch = substr($line, $i, 1);
+
+        # Line comments
+        if ($in_str == 0 && $in_char == 0) {
+            if ($lang eq "c" && $i + 1 < $len && substr($line, $i, 2) eq "//") {
+                $out = $out . $E . "[90m" . substr($line, $i) . $reset;
+                return $out;
+            }
+            if (($lang eq "perl" || $lang eq "strada") && $ch eq "#") {
+                $out = $out . $E . "[90m" . substr($line, $i) . $reset;
+                return $out;
+            }
+            # C preprocessor lines
+            if ($lang eq "c" && $ch eq "#" && $i == 0) {
+                # Highlight the directive word
+                my int $j = 0;
+                while ($j < $len && substr($line, $j, 1) eq " ") {
+                    $j = $j + 1;
+                }
+                if ($j < $len && substr($line, $j, 1) eq "#") {
+                    $out = $out . $E . "[34m" . $line . $reset;
+                    return $out;
+                }
+            }
+        }
+
+        # Double-quoted strings
+        if ($in_char == 0 && $in_str == 0 && $ch eq "\"") {
+            $in_str = 1;
+            $out = $out . $E . "[32m\"";
+            $i = $i + 1;
+            while ($i < $len) {
+                $ch = substr($line, $i, 1);
+                if ($ch eq "\\" && $i + 1 < $len) {
+                    $out = $out . $ch . substr($line, $i + 1, 1);
+                    $i = $i + 2;
+                } elsif ($ch eq "\"") {
+                    $out = $out . "\"" . $reset;
+                    $in_str = 0;
+                    $i = $i + 1;
+                    last;
+                } else {
+                    $out = $out . $ch;
+                    $i = $i + 1;
+                }
+            }
+            if ($in_str == 1) {
+                $out = $out . $reset;
+                $in_str = 0;
+            }
+            next;
+        }
+
+        # Single-quoted strings
+        if ($in_str == 0 && $in_char == 0 && $ch eq "'") {
+            $in_char = 1;
+            $out = $out . $E . "[32m'";
+            $i = $i + 1;
+            while ($i < $len) {
+                $ch = substr($line, $i, 1);
+                if ($ch eq "\\" && $i + 1 < $len) {
+                    $out = $out . $ch . substr($line, $i + 1, 1);
+                    $i = $i + 2;
+                } elsif ($ch eq "'") {
+                    $out = $out . "'" . $reset;
+                    $in_char = 0;
+                    $i = $i + 1;
+                    last;
+                } else {
+                    $out = $out . $ch;
+                    $i = $i + 1;
+                }
+            }
+            if ($in_char == 1) {
+                $out = $out . $reset;
+                $in_char = 0;
+            }
+            next;
+        }
+
+        # Sigils for Perl/Strada
+        if (($lang eq "perl" || $lang eq "strada") && ($ch eq "$" || $ch eq "@" || $ch eq "%")) {
+            my str $sigil = $ch;
+            $i = $i + 1;
+            my str $varname = "";
+            while ($i < $len && is_word_char(u8_char_at($line, $i)) == 1) {
+                my int $vnext = u8_next($line, $i);
+                $varname = $varname . substr($line, $i, $vnext - $i);
+                $i = $vnext;
+            }
+            if (length($varname) > 0) {
+                $out = $out . $E . "[36;1m" . $sigil . $varname . $reset;
+            } else {
+                $out = $out . $sigil;
+            }
+            next;
+        }
+
+        # Keywords / identifiers
+        if (is_word_char($ch) == 1) {
+            my int $start = $i;
+            while ($i < $len && is_word_char(u8_char_at($line, $i)) == 1) {
+                $i = u8_next($line, $i);
+            }
+            my str $word = substr($line, $start, $i - $start);
+            my str $color = "";
+            if (defined($kw_map->{$word})) {
+                $color = $kw_map->{$word};
+            }
+            if (length($color) > 0) {
+                $out = $out . $E . "[" . $color . "m" . $word . $reset;
+            } else {
+                $out = $out . $word;
+            }
+            next;
+        }
+
+        # Numbers
+        if (is_digit($ch) == 1) {
+            my int $start = $i;
+            while ($i < $len) {
+                my str $nc = substr($line, $i, 1);
+                if (is_digit($nc) == 1 || $nc eq "." || $nc eq "x" || $nc eq "X") {
+                    $i = $i + 1;
+                } else {
+                    last;
+                }
+            }
+            $out = $out . $E . "[35m" . substr($line, $start, $i - $start) . $reset;
+            next;
+        }
+
+        # Advance by full UTF-8 character
+        my int $nxi = u8_next($line, $i);
+        $out = $out . substr($line, $i, $nxi - $i);
+        $i = $nxi;
+    }
+    return $out;
+}
+
+# ===========================================================================
+# Vim Syntax File Loading
+# ===========================================================================
+
+func vim_syntax_load(str $path) void {
+    my scalar $fh = core::open($path, "r");
+    if (!defined($fh)) {
+        set_msg("Cannot load vim syntax: " . $path);
+        return;
+    }
+    if (!defined($VIM_SYN)) {
+        $VIM_SYN = {};
+    }
+
+    my scalar $syn = {};
+    $syn->{"keywords"} = {};
+    $syn->{"matches"} = {};
+    $syn->{"regions"} = {};
+    $syn->{"links"} = {};
+
+    my str $line = <$fh>;
+    while (defined($line)) {
+        # Remove leading/trailing whitespace
+        $line = trim($line);
+
+        # syn keyword GroupName word1 word2 ...
+        if (index($line, "syn keyword ") == 0 || index($line, "syntax keyword ") == 0) {
+            my str $rest = "";
+            if (index($line, "syn keyword ") == 0) {
+                $rest = substr($line, 12);
+            } else {
+                $rest = substr($line, 15);
+            }
+            my int $sp = index($rest, " ");
+            if ($sp > 0) {
+                my str $group = substr($rest, 0, $sp);
+                my str $words = substr($rest, $sp + 1);
+                # Remove contained, nextgroup, etc.
+                my int $cpos = index($words, " contained");
+                if ($cpos >= 0) {
+                    $words = substr($words, 0, $cpos);
+                }
+                my scalar $kw_hash = $syn->{"keywords"};
+                if (defined($kw_hash->{$group})) {
+                    $kw_hash->{$group} = $kw_hash->{$group} . " " . $words;
+                } else {
+                    $kw_hash->{$group} = $words;
+                }
+            }
+        }
+
+        # syn match GroupName /pattern/
+        if (index($line, "syn match ") == 0 || index($line, "syntax match ") == 0) {
+            my str $rest = "";
+            if (index($line, "syn match ") == 0) {
+                $rest = substr($line, 10);
+            } else {
+                $rest = substr($line, 13);
+            }
+            my int $sp = index($rest, " ");
+            if ($sp > 0) {
+                my str $group = substr($rest, 0, $sp);
+                my str $pstr = substr($rest, $sp + 1);
+                # Extract pattern between /.../ or +...+
+                my int $plen = length($pstr);
+                if ($plen > 2) {
+                    my str $delim = substr($pstr, 0, 1);
+                    if ($delim eq "/" || $delim eq "+") {
+                        my int $end = index(substr($pstr, 1), $delim);
+                        if ($end > 0) {
+                            my str $pat = substr($pstr, 1, $end);
+                            my scalar $mh = $syn->{"matches"};
+                            $mh->{$group} = $pat;
+                        }
+                    }
+                }
+            }
+        }
+
+        # syn region GroupName start=/pat/ end=/pat/
+        if (index($line, "syn region ") == 0 || index($line, "syntax region ") == 0) {
+            my str $rest = "";
+            if (index($line, "syn region ") == 0) {
+                $rest = substr($line, 11);
+            } else {
+                $rest = substr($line, 14);
+            }
+            my int $sp = index($rest, " ");
+            if ($sp > 0) {
+                my str $group = substr($rest, 0, $sp);
+                my str $opts = substr($rest, $sp + 1);
+                my str $start_pat = "";
+                my str $end_pat = "";
+                my int $si = index($opts, "start=");
+                if ($si >= 0) {
+                    my str $after = substr($opts, $si + 6);
+                    my str $delim = substr($after, 0, 1);
+                    if ($delim eq "/" || $delim eq "+" || $delim eq "\"") {
+                        my int $end2 = index(substr($after, 1), $delim);
+                        if ($end2 > 0) {
+                            $start_pat = substr($after, 1, $end2);
+                        }
+                    }
+                }
+                my int $ei = index($opts, "end=");
+                if ($ei >= 0) {
+                    my str $after = substr($opts, $ei + 4);
+                    my str $delim = substr($after, 0, 1);
+                    if ($delim eq "/" || $delim eq "+" || $delim eq "\"") {
+                        my int $end2 = index(substr($after, 1), $delim);
+                        if ($end2 > 0) {
+                            $end_pat = substr($after, 1, $end2);
+                        }
+                    }
+                }
+                if (length($start_pat) > 0 && length($end_pat) > 0) {
+                    my scalar $rh = $syn->{"regions"};
+                    my scalar $reg = {};
+                    $reg->{"start"} = $start_pat;
+                    $reg->{"end"} = $end_pat;
+                    $rh->{$group} = $reg;
+                }
+            }
+        }
+
+        # hi def link GroupName HighlightGroup
+        # hi link GroupName HighlightGroup
+        if (index($line, "hi def link ") == 0 || index($line, "hi link ") == 0 || index($line, "highlight def link ") == 0 || index($line, "HiLink ") == 0) {
+            my str $rest = $line;
+            if (index($rest, "hi def link ") == 0) {
+                $rest = substr($rest, 12);
+            } elsif (index($rest, "hi link ") == 0) {
+                $rest = substr($rest, 8);
+            } elsif (index($rest, "highlight def link ") == 0) {
+                $rest = substr($rest, 19);
+            } else {
+                $rest = substr($rest, 7);
+            }
+            $rest = trim($rest);
+            my int $sp = index($rest, " ");
+            if ($sp == -1) {
+                $sp = index($rest, "\t");
+            }
+            if ($sp > 0) {
+                my str $group = substr($rest, 0, $sp);
+                my str $target = trim(substr($rest, $sp + 1));
+                my scalar $lh = $syn->{"links"};
+                $lh->{$group} = $target;
+            }
+        }
+
+        $line = <$fh>;
+    }
+    core::close($fh);
+
+    # Detect language from filename
+    my str $lang = syn_detect($path);
+    if (length($lang) == 0) {
+        # Try to guess from the path
+        if (index($path, "/c.vim") >= 0 || index($path, "/c/") >= 0) {
+            $lang = "c";
+        } elsif (index($path, "/perl.vim") >= 0 || index($path, "/perl/") >= 0) {
+            $lang = "perl";
+        } elsif (index($path, "/strada.vim") >= 0) {
+            $lang = "strada";
+        } else {
+            # Use the filename stem
+            my int $spos = 0;
+            my int $si = 0;
+            while ($si < length($path)) {
+                if (substr($path, $si, 1) eq "/") {
+                    $spos = $si + 1;
+                }
+                $si = $si + 1;
+            }
+            my str $base = substr($path, $spos);
+            my int $dpos = index($base, ".");
+            if ($dpos > 0) {
+                $lang = substr($base, 0, $dpos);
+            } else {
+                $lang = $base;
+            }
+        }
+    }
+
+    $VIM_SYN->{$lang} = $syn;
+    set_msg("Loaded vim syntax for: " . $lang);
+}
+
+func vim_group_to_ansi(str $group) str {
+    if ($group eq "Comment") { return "90"; }
+    if ($group eq "Constant") { return "31"; }
+    if ($group eq "String") { return "32"; }
+    if ($group eq "Character") { return "32"; }
+    if ($group eq "Number") { return "35"; }
+    if ($group eq "Float") { return "35"; }
+    if ($group eq "Boolean") { return "35"; }
+    if ($group eq "Identifier") { return "36;1"; }
+    if ($group eq "Function") { return "33;1"; }
+    if ($group eq "Statement") { return "33"; }
+    if ($group eq "Conditional") { return "33"; }
+    if ($group eq "Repeat") { return "33"; }
+    if ($group eq "Label") { return "33"; }
+    if ($group eq "Operator") { return "33"; }
+    if ($group eq "Keyword") { return "33"; }
+    if ($group eq "Exception") { return "31;1"; }
+    if ($group eq "PreProc") { return "34"; }
+    if ($group eq "Include") { return "34"; }
+    if ($group eq "Define") { return "34"; }
+    if ($group eq "Macro") { return "34"; }
+    if ($group eq "PreCondit") { return "34"; }
+    if ($group eq "Type") { return "36"; }
+    if ($group eq "StorageClass") { return "36"; }
+    if ($group eq "Structure") { return "36"; }
+    if ($group eq "Typedef") { return "36"; }
+    if ($group eq "Special") { return "35"; }
+    if ($group eq "SpecialChar") { return "35"; }
+    if ($group eq "Tag") { return "35"; }
+    if ($group eq "Delimiter") { return "35"; }
+    if ($group eq "SpecialComment") { return "90;1"; }
+    if ($group eq "Debug") { return "31"; }
+    if ($group eq "Error") { return "37;41"; }
+    if ($group eq "Todo") { return "33;1"; }
+    return "";
+}
+
+func vim_resolve_color(scalar $syn, str $group) str {
+    my scalar $links = $syn->{"links"};
+    my int $depth = 0;
+    my str $cur = $group;
+    while ($depth < 10) {
+        my str $ansi = vim_group_to_ansi($cur);
+        if (length($ansi) > 0) {
+            return $ansi;
+        }
+        if (defined($links->{$cur})) {
+            $cur = $links->{$cur};
+        } else {
+            return "";
+        }
+        $depth = $depth + 1;
+    }
+    return "";
+}
+
+func vim_highlight(str $line, str $lang) str {
+    if (!defined($VIM_SYN)) { return ""; }
+    if (!defined($VIM_SYN->{$lang})) { return ""; }
+
+    my scalar $syn = $VIM_SYN->{$lang};
+    my scalar $kw_groups = $syn->{"keywords"};
+    my str $reset = $E . "[0m";
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($line);
+
+    while ($i < $len) {
+        my str $ch = substr($line, $i, 1);
+
+        # Keywords
+        if (is_word_char($ch) == 1) {
+            my int $start = $i;
+            while ($i < $len && is_word_char(u8_char_at($line, $i)) == 1) {
+                $i = u8_next($line, $i);
+            }
+            my str $word = substr($line, $start, $i - $start);
+            my str $found_color = "";
+            # Check each keyword group
+            my array @groups = keys(%$kw_groups);
+            my int $gi = 0;
+            while ($gi < scalar(@groups)) {
+                my str $grp = $groups[$gi];
+                my str $words = $kw_groups->{$grp};
+                # Check if word is in the word list
+                if (index(" " . $words . " ", " " . $word . " ") >= 0) {
+                    $found_color = vim_resolve_color($syn, $grp);
+                    last;
+                }
+                $gi = $gi + 1;
+            }
+            if (length($found_color) > 0) {
+                $out = $out . $E . "[" . $found_color . "m" . $word . $reset;
+            } else {
+                $out = $out . $word;
+            }
+            next;
+        }
+
+        # Non-word: advance by full UTF-8 character
+        my int $ni = u8_next($line, $i);
+        $out = $out . substr($line, $i, $ni - $i);
+        $i = $ni;
+    }
+    return $out;
+}
+
+# ===========================================================================
+# Display / Rendering
+# ===========================================================================
+
+func clamp_cursor() void {
+    my int $n = line_count();
+    if ($CY >= $n) {
+        $CY = $n - 1;
+    }
+    if ($CY < 0) {
+        $CY = 0;
+    }
+    my int $ll = length(get_line($CY));
+    if ($CX > $ll) {
+        $CX = $ll;
+    }
+    if ($CX < 0) {
+        $CX = 0;
+    }
+}
+
+func win_edit_rows() int {
+    if ($WIN_COUNT <= 1) { return $EDIT_ROWS; }
+    my scalar $w = $WINDOWS->[$WIN_IDX];
+    return $w->{"height"};
+}
+
+func win_text_cols() int {
+    if ($WIN_COUNT <= 1) { return $COLS; }
+    my scalar $w = $WINDOWS->[$WIN_IDX];
+    return $w->{"width"};
+}
+
+func scroll_adjust() void {
+    my int $vis_rows = win_edit_rows();
+    if ($CY < $SY) {
+        $SY = $CY;
+    }
+    if ($CY >= $SY + $vis_rows) {
+        $SY = $CY - $vis_rows + 1;
+    }
+    # Horizontal scroll uses display columns
+    my int $vis_cols = win_text_cols();
+    my int $cursor_col = u8_byte_to_col(get_line($CY), $CX);
+    if ($cursor_col < $SX) {
+        $SX = $cursor_col;
+    }
+    if ($cursor_col >= $SX + $vis_cols - 4) {
+        $SX = $cursor_col - $vis_cols + 8;
+    }
+    if ($SX < 0) {
+        $SX = 0;
+    }
+}
+
+# Find matching bracket. Returns "line,col" or "" if no match.
+# Searches forward for opening brackets, backward for closing brackets.
+func find_matching_bracket(int $y, int $x) str {
+    my str $line = get_line($y);
+    if ($x >= length($line)) { return ""; }
+    my str $ch = substr($line, $x, 1);
+
+    my str $open = "";
+    my str $close = "";
+    my int $dir = 0;
+
+    if ($ch eq "(") { $open = "("; $close = ")"; $dir = 1; }
+    elsif ($ch eq ")") { $open = "("; $close = ")"; $dir = -1; }
+    elsif ($ch eq "{") { $open = "{"; $close = "}"; $dir = 1; }
+    elsif ($ch eq "}") { $open = "{"; $close = "}"; $dir = -1; }
+    elsif ($ch eq "[") { $open = "["; $close = "]"; $dir = 1; }
+    elsif ($ch eq "]") { $open = "["; $close = "]"; $dir = -1; }
+
+    if ($dir == 0) { return ""; }
+
+    my int $depth = 0;
+    my int $cy = $y;
+    my int $cx = $x;
+    my int $max_lines = line_count();
+    # Limit search to 1000 lines in either direction
+    my int $searched = 0;
+
+    if ($dir == 1) {
+        # Forward search
+        while ($cy < $max_lines && $searched < 1000) {
+            my str $l = get_line($cy);
+            my int $llen = length($l);
+            while ($cx < $llen) {
+                my str $c = substr($l, $cx, 1);
+                if ($c eq $open) {
+                    $depth = $depth + 1;
+                } elsif ($c eq $close) {
+                    $depth = $depth - 1;
+                    if ($depth == 0) {
+                        return "" . $cy . "," . $cx;
+                    }
+                }
+                $cx = $cx + 1;
+            }
+            $cy = $cy + 1;
+            $cx = 0;
+            $searched = $searched + 1;
+        }
+    } else {
+        # Backward search
+        while ($cy >= 0 && $searched < 1000) {
+            my str $l = get_line($cy);
+            while ($cx >= 0) {
+                my str $c = substr($l, $cx, 1);
+                if ($c eq $close) {
+                    $depth = $depth + 1;
+                } elsif ($c eq $open) {
+                    $depth = $depth - 1;
+                    if ($depth == 0) {
+                        return "" . $cy . "," . $cx;
+                    }
+                }
+                $cx = $cx - 1;
+            }
+            $cy = $cy - 1;
+            if ($cy >= 0) {
+                $cx = length(get_line($cy)) - 1;
+            }
+            $searched = $searched + 1;
+        }
+    }
+    return "";
+}
+
+
+# Find the name of the function enclosing the cursor line.
+# Scans backward from $CY looking for function definition patterns.
+func which_function() str {
+    if ($WHICH_FUNC == 0) { return ""; }
+    my int $y = $CY;
+    my int $brace_depth = 0;
+
+    # For C: track brace depth to find the function we're inside
+    # For Strada/Perl: look for func/fn/sub at indent level 0
+
+    while ($y >= 0) {
+        my str $line = get_line($y);
+        my int $len = length($line);
+
+        # Count braces on this line (below cursor) to track depth
+        if ($y < $CY) {
+            my int $bi = 0;
+            while ($bi < $len) {
+                my str $bc = substr($line, $bi, 1);
+                if ($bc eq "{") { $brace_depth = $brace_depth - 1; }
+                elsif ($bc eq "}") { $brace_depth = $brace_depth + 1; }
+                $bi = $bi + 1;
+            }
+        }
+
+        # Only match at brace depth 0 or less (we're inside this function)
+        if ($brace_depth <= 0) {
+            if ($SYNTAX eq "c") {
+                # C: look for "type name(" pattern at start of line
+                # Match lines like: int foo(, void bar(, static int baz(
+                # Skip lines starting with # (preprocessor) or // (comment)
+                if ($len > 0 && substr($line, 0, 1) ne "#" && substr($line, 0, 1) ne " " && substr($line, 0, 1) ne "\t") {
+                    my int $paren = index($line, "(");
+                    if ($paren > 0) {
+                        # Walk backward from ( to find the function name
+                        my int $end = $paren;
+                        my int $start = $end - 1;
+                        while ($start >= 0 && is_word_char(substr($line, $start, 1)) == 1) {
+                            $start = $start - 1;
+                        }
+                        $start = $start + 1;
+                        if ($start < $end) {
+                            my str $name = substr($line, $start, $end - $start);
+                            # Skip common non-function keywords
+                            if ($name ne "if" && $name ne "while" && $name ne "for" && $name ne "switch" && $name ne "return") {
+                                return $name;
+                            }
+                        }
+                    }
+                }
+            } elsif ($SYNTAX eq "strada" || $SYNTAX eq "perl") {
+                # Strada: func/fn name(  or  Perl: sub name
+                my str $trimmed = $line;
+                my int $ti = 0;
+                while ($ti < length($trimmed) && (substr($trimmed, $ti, 1) eq " " || substr($trimmed, $ti, 1) eq "\t")) {
+                    $ti = $ti + 1;
+                }
+                if ($ti > 0 && $ti < length($trimmed)) {
+                    $trimmed = substr($trimmed, $ti);
+                }
+                my int $is_func = 0;
+                my str $after = "";
+                if (length($trimmed) > 5 && substr($trimmed, 0, 5) eq "func ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 5);
+                } elsif (length($trimmed) > 3 && substr($trimmed, 0, 3) eq "fn ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 3);
+                } elsif (length($trimmed) > 4 && substr($trimmed, 0, 4) eq "sub ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 4);
+                }
+                # Also match "async func", "private func", etc.
+                if ($is_func == 0 && length($trimmed) > 11 && substr($trimmed, 0, 11) eq "async func ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 11);
+                }
+                if ($is_func == 0 && length($trimmed) > 13 && substr($trimmed, 0, 13) eq "private func ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 13);
+                }
+                if ($is_func == 0 && length($trimmed) > 9 && substr($trimmed, 0, 9) eq "async fn ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 9);
+                }
+                if ($is_func == 0 && length($trimmed) > 11 && substr($trimmed, 0, 11) eq "private fn ") {
+                    $is_func = 1;
+                    $after = substr($trimmed, 11);
+                }
+                if ($is_func == 1 && length($after) > 0) {
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+            } elsif ($SYNTAX eq "python") {
+                # Python: def name(
+                my str $trimmed = $line;
+                my int $ti = 0;
+                while ($ti < length($trimmed) && (substr($trimmed, $ti, 1) eq " " || substr($trimmed, $ti, 1) eq "\t")) {
+                    $ti = $ti + 1;
+                }
+                if ($ti > 0 && $ti < length($trimmed)) {
+                    $trimmed = substr($trimmed, $ti);
+                }
+                if (length($trimmed) > 4 && substr($trimmed, 0, 4) eq "def ") {
+                    my str $after = substr($trimmed, 4);
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+                if (length($trimmed) > 10 && substr($trimmed, 0, 10) eq "async def ") {
+                    my str $after = substr($trimmed, 10);
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+            } elsif ($SYNTAX eq "javascript") {
+                # JS: function name(  or  name(  or  const name =
+                my str $trimmed = $line;
+                my int $ti = 0;
+                while ($ti < length($trimmed) && (substr($trimmed, $ti, 1) eq " " || substr($trimmed, $ti, 1) eq "\t")) {
+                    $ti = $ti + 1;
+                }
+                if ($ti > 0 && $ti < length($trimmed)) {
+                    $trimmed = substr($trimmed, $ti);
+                }
+                if (length($trimmed) > 9 && substr($trimmed, 0, 9) eq "function ") {
+                    my str $after = substr($trimmed, 9);
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+                if (length($trimmed) > 15 && substr($trimmed, 0, 15) eq "async function ") {
+                    my str $after = substr($trimmed, 15);
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+            } elsif ($SYNTAX eq "shell") {
+                # Shell: name() {  or  function name
+                my str $trimmed = $line;
+                my int $ti = 0;
+                while ($ti < length($trimmed) && (substr($trimmed, $ti, 1) eq " " || substr($trimmed, $ti, 1) eq "\t")) {
+                    $ti = $ti + 1;
+                }
+                if ($ti > 0 && $ti < length($trimmed)) {
+                    $trimmed = substr($trimmed, $ti);
+                }
+                if (length($trimmed) > 9 && substr($trimmed, 0, 9) eq "function ") {
+                    my str $after = substr($trimmed, 9);
+                    my int $ni = 0;
+                    while ($ni < length($after) && is_word_char(substr($after, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni > 0) {
+                        return substr($after, 0, $ni);
+                    }
+                }
+                # name() pattern
+                my int $paren = index($trimmed, "()");
+                if ($paren > 0) {
+                    my int $ni = 0;
+                    while ($ni < $paren && is_word_char(substr($trimmed, $ni, 1)) == 1) {
+                        $ni = $ni + 1;
+                    }
+                    if ($ni == $paren && $ni > 0) {
+                        return substr($trimmed, 0, $ni);
+                    }
+                }
+            }
+        }
+        $y = $y - 1;
+    }
+    return "";
+}
+
+func linum_width() int {
+    if ($LINUM == 0) { return 0; }
+    # Width = digits of max line number + 1 space
+    my int $maxln = line_count();
+    my int $digits = 1;
+    while ($maxln >= 10) {
+        $maxln = ($maxln - $maxln % 10) / 10;
+        $digits = $digits + 1;
+    }
+    if ($digits < 3) { $digits = 3; }
+    return $digits + 1;  # +1 for separator space
+}
+
+func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int $lcount, int $is_active, int $bar_width) str {
+    my str $out = "";
+    if ($is_active == 1) {
+        $out = $out . $E . "[7m";
+    } else {
+        $out = $out . $E . "[7;2m";
+    }
+    my str $left = " ";
+    if ($dirty == 1) {
+        $left = $left . "**";
+    } else {
+        $left = $left . "--";
+    }
+    $left = $left . " " . $bname;
+    if ($is_active == 1) {
+        my str $wf = which_function();
+        if (length($wf) > 0) {
+            $left = $left . "  " . $wf . "()";
+        }
+    }
+    my int $display_col = u8_byte_to_col(get_line($cy), $cx) + 1;
+    my str $right = " L" . ($cy + 1) . "/" . $lcount . " C" . $display_col . " ";
+    $right = "(" . $mode . ") " . $right;
+    my int $pad = $bar_width - length($left) - length($right);
+    if ($pad < 0) { $pad = 0; }
+    $out = $out . $left;
+    my int $pi = 0;
+    while ($pi < $pad) {
+        $out = $out . " ";
+        $pi = $pi + 1;
+    }
+    $out = $out . $right;
+    $out = $out . $E . "[0m";
+    return $out;
+}
+
+func render() void {
+    clamp_cursor();
+    scroll_adjust();
+
+    my int $gutter = linum_width();
+
+    # Bracket matching (only for active window)
+    my int $match_y = -1;
+    my int $match_x = -1;
+    my int $cursor_is_bracket = 0;
+    my str $cursor_line = get_line($CY);
+    if ($CX < length($cursor_line)) {
+        my str $cch = substr($cursor_line, $CX, 1);
+        if ($cch eq "(" || $cch eq ")" || $cch eq "{" || $cch eq "}" || $cch eq "[" || $cch eq "]") {
+            $cursor_is_bracket = 1;
+            my str $match_str = find_matching_bracket($CY, $CX);
+            if (length($match_str) > 0) {
+                my int $comma = index($match_str, ",");
+                if ($comma > 0) {
+                    my str $my_s = substr($match_str, 0, $comma);
+                    my str $mx_s = substr($match_str, $comma + 1);
+                    my int $my = core::atoi($my_s);
+                    my int $mx = core::atoi($mx_s);
+                    $match_y = $my;
+                    $match_x = $mx;
+                }
+            }
+        }
+    }
+
+    my str $out = "";
+    $out = $out . $E . "[?25l";
+
+    # Save active window state
+    my int $save_buf_idx = $BUF_IDX;
+    my int $save_cy = $CY;
+    my int $save_cx = $CX;
+    my int $save_sy = $SY;
+    my int $save_sx = $SX;
+    my int $save_dirty = $DIRTY;
+    my str $save_bname = $BNAME;
+    my str $save_syntax = $SYNTAX;
+    my str $save_mode = $MODE;
+    my scalar $save_cl = $CL;
+
+    # Active window geometry for cursor positioning later
+    my int $active_top = 0;
+    my int $active_left = 0;
+    my int $active_width = $COLS;
+    my int $active_height = $EDIT_ROWS;
+
+    my int $wi = 0;
+    while ($wi < $WIN_COUNT) {
+        my scalar $win = $WINDOWS->[$wi];
+        my int $win_height = $win->{"height"};
+        my int $win_left = $win->{"left_col"};
+        my int $win_width = $win->{"width"};
+        my int $win_top = $win->{"top_row"};
+        my int $is_active = 0;
+        if ($wi == $WIN_IDX) { $is_active = 1; }
+
+        # Per-window text columns
+        my int $text_cols = $win_width - $gutter;
+        if ($text_cols < 1) { $text_cols = 1; }
+
+        # Load this window's buffer state
+        my int $wbi = $win->{"buf_idx"};
+        if ($is_active == 1) {
+            $active_top = $win_top;
+            $active_left = $win_left;
+            $active_width = $win_width;
+            $active_height = $win_height;
+            # Restore active window's globals (may have been overwritten by prior non-active window)
+            $BUF_IDX = $save_buf_idx;
+            $CL = $save_cl;
+            $CY = $save_cy;
+            $CX = $save_cx;
+            $SY = $save_sy;
+            $SX = $save_sx;
+            $DIRTY = $save_dirty;
+            $BNAME = $save_bname;
+            $SYNTAX = $save_syntax;
+            $MODE = $save_mode;
+        } else {
+            my scalar $wbuf = $BUFFERS->[$wbi];
+            $BUF_IDX = $wbi;
+            $CL = $wbuf->{"lines"};
+            $DIRTY = $wbuf->{"dirty"};
+            $BNAME = $wbuf->{"name"};
+            $SYNTAX = $wbuf->{"syntax"};
+            $MODE = $wbuf->{"mode"};
+            if (length($MODE) == 0) { $MODE = "Text"; }
+            # Use per-window cursor/scroll state
+            if (defined($win->{"cy"})) {
+                $CY = $win->{"cy"};
+                $CX = $win->{"cx"};
+                $SY = $win->{"sy"};
+                $SX = $win->{"sx"};
+            } else {
+                $CY = $wbuf->{"cy"};
+                $CX = $wbuf->{"cx"};
+                $SY = $wbuf->{"sy"};
+                $SX = $wbuf->{"sx"};
+            }
+        }
+
+        # Draw text rows for this window using absolute positioning
+        my int $r = 0;
+        while ($r < $win_height) {
+            my int $filerow = $r + $SY;
+            my int $scr_row = $win_top + $r + 1;
+            my int $scr_col = $win_left + 1;
+            $out = $out . $E . "[" . $scr_row . ";" . $scr_col . "H";
+
+            my str $row_content = "";
+            if ($filerow < line_count()) {
+                if ($gutter > 0) {
+                    my str $num = "" . ($filerow + 1);
+                    my int $pad_len = $gutter - 1 - length($num);
+                    my str $pad_str = "";
+                    while ($pad_len > 0) {
+                        $pad_str = $pad_str . " ";
+                        $pad_len = $pad_len - 1;
+                    }
+                    $row_content = $row_content . $E . "[90m" . $pad_str . $num . " " . $E . "[0m";
+                }
+                my str $raw = get_line($filerow);
+                my str $display = $raw;
+                if ($SX > 0) {
+                    $display = u8_skip_cols($display, $SX);
+                }
+                $display = u8_truncate($display, $text_cols);
+                if (length($SYNTAX) > 0) {
+                    $display = highlight_line($display, $SYNTAX);
+                }
+                $row_content = $row_content . $display;
+            } else {
+                if ($gutter > 0) {
+                    my str $gpad = "";
+                    my int $gi = 0;
+                    while ($gi < $gutter - 1) {
+                        $gpad = $gpad . " ";
+                        $gi = $gi + 1;
+                    }
+                    $row_content = $row_content . $E . "[90m" . $gpad . "~" . $E . "[0m";
+                } else {
+                    $row_content = $row_content . $E . "[90m~" . $E . "[0m";
+                }
+            }
+            # Pad to full window width and clear rest of line within window
+            $out = $out . $row_content . $E . "[K";
+            $r = $r + 1;
+        }
+
+        # Draw status bar for this window
+        my int $bar_row = $win_top + $win_height + 1;
+        $out = $out . $E . "[" . $bar_row . ";" . ($win_left + 1) . "H";
+        $out = $out . render_status_bar($BNAME, $MODE, $DIRTY, $CY, $CX, line_count(), $is_active, $win_width);
+
+        $wi = $wi + 1;
+    }
+
+    # Draw vertical separators between side-by-side windows
+    if ($WIN_COUNT > 1) {
+        my int $si = 0;
+        while ($si < $WIN_COUNT - 1) {
+            my scalar $sw = $WINDOWS->[$si];
+            my scalar $sw_next = $WINDOWS->[$si + 1];
+            # Check if these windows are side-by-side (same top_row)
+            if ($sw->{"top_row"} == $sw_next->{"top_row"}) {
+                my int $sep_col = $sw->{"left_col"} + $sw->{"width"} + 1;
+                my int $sep_top = $sw->{"top_row"};
+                my int $sep_height = $sw->{"height"};
+                my int $sr = 0;
+                while ($sr <= $sep_height) {
+                    $out = $out . $E . "[" . ($sep_top + $sr + 1) . ";" . $sep_col . "H";
+                    if ($sr == $sep_height) {
+                        # Status bar row separator
+                        $out = $out . $E . "[7m|" . $E . "[0m";
+                    } else {
+                        my str $vline = chr(0xE2) . chr(0x94) . chr(0x82);
+                        $out = $out . $E . "[90m" . $vline . $E . "[0m";
+                    }
+                    $sr = $sr + 1;
+                }
+            }
+            $si = $si + 1;
+        }
+    }
+
+    # Restore active window state
+    $BUF_IDX = $save_buf_idx;
+    $CY = $save_cy;
+    $CX = $save_cx;
+    $SY = $save_sy;
+    $SX = $save_sx;
+    $DIRTY = $save_dirty;
+    $BNAME = $save_bname;
+    $SYNTAX = $save_syntax;
+    $MODE = $save_mode;
+    $CL = $save_cl;
+
+    # Message bar (always at bottom row)
+    my int $msg_row = $ROWS;
+    $out = $out . $E . "[" . $msg_row . ";1H" . $E . "[K";
+    if (length($MSG) > 0) {
+        my str $mtext = $MSG;
+        if (length($mtext) > $COLS) {
+            $mtext = substr($mtext, 0, $COLS);
+        }
+        $out = $out . $mtext;
+    }
+
+    # Per-window text_cols for active window (for bracket/region highlighting)
+    my int $text_cols = $active_width - $gutter;
+    if ($text_cols < 1) { $text_cols = 1; }
+
+    # Bracket match highlighting (active window only)
+    if ($cursor_is_bracket == 1) {
+        my str $hl = $E . "[1;33;44m";
+        my str $rst = $E . "[0m";
+        my int $cy_screen = $CY - $SY + $active_top;
+        my int $cx_screen = $CX - $SX;
+        if ($cy_screen >= $active_top && $cy_screen < $active_top + $active_height && $cx_screen >= 0 && $cx_screen < $text_cols) {
+            my str $bch = substr(get_line($CY), $CX, 1);
+            my int $brow = $cy_screen + 1;
+            my int $bcol = $cx_screen + 1 + $gutter + $active_left;
+            $out = $out . $E . "[" . $brow . ";" . $bcol . "H" . $hl . $bch . $rst;
+        }
+        if ($match_y >= 0) {
+            my int $my_screen = $match_y - $SY + $active_top;
+            my int $mx_screen = $match_x - $SX;
+            if ($my_screen >= $active_top && $my_screen < $active_top + $active_height && $mx_screen >= 0 && $mx_screen < $text_cols) {
+                my str $mch = substr(get_line($match_y), $match_x, 1);
+                my int $mrow = $my_screen + 1;
+                my int $mcol = $mx_screen + 1 + $gutter + $active_left;
+                $out = $out . $E . "[" . $mrow . ";" . $mcol . "H" . $hl . $mch . $rst;
+            }
+        }
+    }
+
+    # Region highlight (active window only)
+    if ($MSET == 1) {
+        my int $rsy = $MY;
+        my int $rsx = $MX;
+        my int $rey = $CY;
+        my int $rex = $CX;
+        if ($rsy > $rey || ($rsy == $rey && $rsx > $rex)) {
+            my int $tmp = $rsy;
+            $rsy = $rey;
+            $rey = $tmp;
+            $tmp = $rsx;
+            $rsx = $rex;
+            $rex = $tmp;
+        }
+        my str $rhl = $E . "[7m";
+        my str $rrst = $E . "[0m";
+        my int $ry = $rsy;
+        while ($ry <= $rey) {
+            my int $scr_y = $ry - $SY + $active_top;
+            if ($scr_y >= $active_top && $scr_y < $active_top + $active_height) {
+                my str $rline = get_line($ry);
+                my int $col_start = 0;
+                my int $col_end = length($rline);
+                if ($ry == $rsy) { $col_start = $rsx; }
+                if ($ry == $rey) { $col_end = $rex; }
+                my int $rc = $col_start;
+                while ($rc < $col_end) {
+                    my int $scr_x = $rc - $SX;
+                    if ($scr_x >= 0 && $scr_x < $text_cols) {
+                        my str $rch = substr($rline, $rc, 1);
+                        my int $rrow = $scr_y + 1;
+                        my int $rcol = $scr_x + 1 + $gutter + $active_left;
+                        $out = $out . $E . "[" . $rrow . ";" . $rcol . "H" . $rhl . $rch . $rrst;
+                    }
+                    $rc = $rc + 1;
+                }
+            }
+            $ry = $ry + 1;
+        }
+    }
+
+    # Position cursor in active window
+    my int $screen_y = $CY - $SY + $active_top + 1;
+    my str $cur_line = get_line($CY);
+    my int $cursor_col = u8_byte_to_col($cur_line, $CX);
+    my int $screen_x = $cursor_col - $SX + 1 + $gutter + $active_left;
+    $out = $out . $E . "[" . $screen_y . ";" . $screen_x . "H";
+
+    $out = $out . $E . "[?25h";
+
+    core::write_fd(1, $out);
+}
+
+# ===========================================================================
+# Cursor Movement
+# ===========================================================================
+
+func move_forward() void {
+    my str $line = get_line($CY);
+    my int $ll = length($line);
+    if ($CX < $ll) {
+        $CX = u8_next($line, $CX);
+    } elsif ($CY < line_count() - 1) {
+        $CY = $CY + 1;
+        $CX = 0;
+    }
+}
+
+func move_backward() void {
+    if ($CX > 0) {
+        $CX = u8_prev(get_line($CY), $CX);
+    } elsif ($CY > 0) {
+        $CY = $CY - 1;
+        $CX = length(get_line($CY));
+    }
+}
+
+func move_up() void {
+    if ($CY > 0) {
+        $CY = $CY - 1;
+    }
+}
+
+func move_down() void {
+    if ($CY < line_count() - 1) {
+        $CY = $CY + 1;
+    }
+}
+
+func move_bol() void {
+    $CX = 0;
+}
+
+func move_eol() void {
+    $CX = length(get_line($CY));
+}
+
+func move_page_down() void {
+    $CY = $CY + win_edit_rows();
+    if ($CY >= line_count()) {
+        $CY = line_count() - 1;
+    }
+}
+
+func move_page_up() void {
+    $CY = $CY - win_edit_rows();
+    if ($CY < 0) {
+        $CY = 0;
+    }
+}
+
+func move_buf_start() void {
+    $CY = 0;
+    $CX = 0;
+}
+
+func move_buf_end() void {
+    $CY = line_count() - 1;
+    $CX = length(get_line($CY));
+}
+
+func move_forward_word() void {
+    my str $line = get_line($CY);
+    my int $ll = length($line);
+    # Skip current word chars
+    while ($CX < $ll && is_word_char(u8_char_at($line, $CX)) == 1) {
+        $CX = u8_next($line, $CX);
+    }
+    # Skip non-word chars
+    while ($CX < $ll && is_word_char(u8_char_at($line, $CX)) == 0) {
+        $CX = u8_next($line, $CX);
+    }
+}
+
+func move_backward_word() void {
+    my str $line = get_line($CY);
+    if ($CX > 0) { $CX = u8_prev($line, $CX); }
+    # Skip non-word chars
+    while ($CX > 0 && is_word_char(u8_char_at($line, $CX)) == 0) {
+        $CX = u8_prev($line, $CX);
+    }
+    # Skip word chars
+    while ($CX > 0) {
+        my int $prev = u8_prev($line, $CX);
+        if (is_word_char(u8_char_at($line, $prev)) == 0) { last; }
+        $CX = $prev;
+    }
+}
+
+# ===========================================================================
+# Editing
+# ===========================================================================
+
+func edit_insert(str $ch) void {
+    undo_save();
+    my str $line = get_line($CY);
+    my str $before = "";
+    if ($CX > 0) {
+        $before = substr($line, 0, $CX);
+    }
+    my str $after = "";
+    if ($CX < length($line)) {
+        $after = substr($line, $CX);
+    }
+    set_line($CY, $before . $ch . $after);
+    $CX = $CX + length($ch);
+    $DIRTY = 1;
+}
+
+func edit_newline() void {
+    undo_save();
+    my str $line = get_line($CY);
+    my str $before = "";
+    if ($CX > 0) {
+        $before = substr($line, 0, $CX);
+    }
+    my str $after = "";
+    if ($CX < length($line)) {
+        $after = substr($line, $CX);
+    }
+    set_line($CY, $before);
+    $CY = $CY + 1;
+    insert_line($CY, $after);
+    $CX = 0;
+    $DIRTY = 1;
+}
+
+func edit_backspace() void {
+    undo_save();
+    if ($CX > 0) {
+        my str $line = get_line($CY);
+        my int $prev = u8_prev($line, $CX);
+        my str $before = "";
+        if ($prev > 0) {
+            $before = substr($line, 0, $prev);
+        }
+        my str $after = "";
+        if ($CX < length($line)) {
+            $after = substr($line, $CX);
+        }
+        set_line($CY, $before . $after);
+        $CX = $prev;
+        $DIRTY = 1;
+    } elsif ($CY > 0) {
+        # Join with previous line
+        my str $cur = get_line($CY);
+        delete_line($CY);
+        $CY = $CY - 1;
+        $CX = length(get_line($CY));
+        set_line($CY, get_line($CY) . $cur);
+        $DIRTY = 1;
+    }
+}
+
+func edit_backward_kill_word() void {
+    if ($CX == 0) { return; }
+    undo_save();
+    my str $line = get_line($CY);
+    my int $end = $CX;
+
+    # Skip non-word characters
+    while ($CX > 0) {
+        my int $prev = u8_prev($line, $CX);
+        if (is_word_char(u8_char_at($line, $prev)) == 1) { last; }
+        $CX = $prev;
+    }
+    # Skip word characters
+    while ($CX > 0) {
+        my int $prev = u8_prev($line, $CX);
+        if (is_word_char(u8_char_at($line, $prev)) == 0) { last; }
+        $CX = $prev;
+    }
+
+    my str $before = "";
+    if ($CX > 0) { $before = substr($line, 0, $CX); }
+    my str $after = "";
+    if ($end < length($line)) { $after = substr($line, $end); }
+    $KILL = substr($line, $CX, $end - $CX);
+    set_line($CY, $before . $after);
+    $DIRTY = 1;
+}
+
+func edit_forward_kill_word() void {
+    my str $line = get_line($CY);
+    if ($CX >= length($line)) { return; }
+    undo_save();
+    my int $start = $CX;
+    my int $len = length($line);
+
+    # Skip word characters
+    while ($CX < $len && is_word_char(u8_char_at($line, $CX)) == 1) {
+        $CX = u8_next($line, $CX);
+    }
+    # Skip non-word characters
+    while ($CX < $len && is_word_char(u8_char_at($line, $CX)) == 0) {
+        $CX = u8_next($line, $CX);
+    }
+    # If we didn't move at all (started on non-word), skip non-word then word
+    if ($CX == $start) {
+        while ($CX < $len && is_word_char(u8_char_at($line, $CX)) == 0) {
+            $CX = u8_next($line, $CX);
+        }
+        while ($CX < $len && is_word_char(u8_char_at($line, $CX)) == 1) {
+            $CX = u8_next($line, $CX);
+        }
+    }
+
+    my str $before = "";
+    if ($start > 0) { $before = substr($line, 0, $start); }
+    my str $after = "";
+    if ($CX < $len) { $after = substr($line, $CX); }
+    $KILL = substr($line, $start, $CX - $start);
+    $CX = $start;
+    set_line($CY, $before . $after);
+    $DIRTY = 1;
+}
+
+func edit_delete() void {
+    undo_save();
+    my str $line = get_line($CY);
+    if ($CX < length($line)) {
+        my str $before = "";
+        if ($CX > 0) {
+            $before = substr($line, 0, $CX);
+        }
+        my int $next = u8_next($line, $CX);
+        my str $after = "";
+        if ($next < length($line)) {
+            $after = substr($line, $next);
+        }
+        set_line($CY, $before . $after);
+        $DIRTY = 1;
+    } elsif ($CY < line_count() - 1) {
+        # Join with next line
+        my str $next = get_line($CY + 1);
+        set_line($CY, $line . $next);
+        delete_line($CY + 1);
+        $DIRTY = 1;
+    }
+}
+
+func edit_kill_line() void {
+    undo_save();
+    my str $line = get_line($CY);
+    if ($CX < length($line)) {
+        $KILL = substr($line, $CX);
+        my str $before = "";
+        if ($CX > 0) {
+            $before = substr($line, 0, $CX);
+        }
+        set_line($CY, $before);
+    } elsif ($CY < line_count() - 1) {
+        $KILL = "\n";
+        my str $next = get_line($CY + 1);
+        set_line($CY, $line . $next);
+        delete_line($CY + 1);
+    }
+    $DIRTY = 1;
+}
+
+func edit_yank() void {
+    undo_save();
+    if (length($KILL) == 0) {
+        set_msg("Kill ring empty.");
+        return;
+    }
+    if ($KILL eq "\n") {
+        edit_newline();
+        return;
+    }
+    # Split kill text on newlines for multi-line paste
+    my array @parts = split("\n", $KILL);
+    if (scalar(@parts) <= 1) {
+        # Single line insert
+        my str $line = get_line($CY);
+        my str $before = "";
+        if ($CX > 0) {
+            $before = substr($line, 0, $CX);
+        }
+        my str $after = "";
+        if ($CX < length($line)) {
+            $after = substr($line, $CX);
+        }
+        set_line($CY, $before . $KILL . $after);
+        $CX = $CX + length($KILL);
+    } else {
+        # Multi-line insert
+        my str $line = get_line($CY);
+        my str $before = "";
+        if ($CX > 0) {
+            $before = substr($line, 0, $CX);
+        }
+        my str $after = "";
+        if ($CX < length($line)) {
+            $after = substr($line, $CX);
+        }
+        # First part goes on current line
+        set_line($CY, $before . $parts[0]);
+        # Middle parts become new lines
+        my int $pi = 1;
+        while ($pi < scalar(@parts) - 1) {
+            insert_line($CY + $pi, $parts[$pi]);
+            $pi = $pi + 1;
+        }
+        # Last part + after text
+        my int $last_idx = scalar(@parts) - 1;
+        my str $last_part = $parts[$last_idx];
+        insert_line($CY + $last_idx, $last_part . $after);
+        $CY = $CY + $last_idx;
+        $CX = length($last_part);
+    }
+    $DIRTY = 1;
+}
+
+func edit_set_mark() void {
+    $MY = $CY;
+    $MX = $CX;
+    $MSET = 1;
+    set_msg("Mark set.");
+}
+
+func get_region_text() str {
+    if ($MSET == 0) {
+        set_msg("No mark set.");
+        return "";
+    }
+    my int $sy = $MY;
+    my int $sx = $MX;
+    my int $ey = $CY;
+    my int $ex = $CX;
+    if ($sy > $ey || ($sy == $ey && $sx > $ex)) {
+        my int $tmp = $sy;
+        $sy = $ey;
+        $ey = $tmp;
+        $tmp = $sx;
+        $sx = $ex;
+        $ex = $tmp;
+    }
+    if ($sy == $ey) {
+        return substr(get_line($sy), $sx, $ex - $sx);
+    }
+    my str $text = substr(get_line($sy), $sx) . "\n";
+    my int $r = $sy + 1;
+    while ($r < $ey) {
+        $text = $text . get_line($r) . "\n";
+        $r = $r + 1;
+    }
+    $text = $text . substr(get_line($ey), 0, $ex);
+    return $text;
+}
+
+func edit_kill_region() void {
+    undo_save();
+    if ($MSET == 0) {
+        set_msg("No mark set.");
+        return;
+    }
+    $KILL = get_region_text();
+    # Delete region
+    my int $sy = $MY;
+    my int $sx = $MX;
+    my int $ey = $CY;
+    my int $ex = $CX;
+    if ($sy > $ey || ($sy == $ey && $sx > $ex)) {
+        my int $tmp = $sy;
+        $sy = $ey;
+        $ey = $tmp;
+        $tmp = $sx;
+        $sx = $ex;
+        $ex = $tmp;
+    }
+    if ($sy == $ey) {
+        my str $line = get_line($sy);
+        my str $before = "";
+        if ($sx > 0) { $before = substr($line, 0, $sx); }
+        my str $after = "";
+        if ($ex < length($line)) { $after = substr($line, $ex); }
+        set_line($sy, $before . $after);
+    } else {
+        my str $first = get_line($sy);
+        my str $last = get_line($ey);
+        my str $before = "";
+        if ($sx > 0) { $before = substr($first, 0, $sx); }
+        my str $after = "";
+        if ($ex < length($last)) { $after = substr($last, $ex); }
+        set_line($sy, $before . $after);
+        # Delete lines from sy+1 to ey
+        my int $d = $ey;
+        while ($d > $sy) {
+            delete_line($sy + 1);
+            $d = $d - 1;
+        }
+    }
+    $CY = $sy;
+    $CX = $sx;
+    $MSET = 0;
+    $DIRTY = 1;
+    set_msg("Region killed.");
+}
+
+func edit_copy_region() void {
+    if ($MSET == 0) {
+        set_msg("No mark set.");
+        return;
+    }
+    $KILL = get_region_text();
+    $MSET = 0;
+    set_msg("Region copied.");
+}
+
+func fill_paragraph() void {
+    # Find paragraph boundaries: a paragraph is delimited by blank lines
+    my int $lc = line_count();
+
+    # Find start of paragraph (search backward for blank line or BOF)
+    my int $para_start = $CY;
+    while ($para_start > 0) {
+        my str $prev = get_line($para_start - 1);
+        if (length($prev) == 0) {
+            last;
+        }
+        $para_start = $para_start - 1;
+    }
+
+    # Find end of paragraph (search forward for blank line or EOF)
+    my int $para_end = $CY;
+    while ($para_end < $lc - 1) {
+        my str $nxt = get_line($para_end + 1);
+        if (length($nxt) == 0) {
+            last;
+        }
+        $para_end = $para_end + 1;
+    }
+
+    if ($para_start > $para_end) { return; }
+
+    # Detect leading indent from first line
+    my str $first = get_line($para_start);
+    my int $indent_len = 0;
+    while ($indent_len < length($first)) {
+        my str $ic = substr($first, $indent_len, 1);
+        if ($ic eq " " || $ic eq "\t") {
+            $indent_len = $indent_len + 1;
+        } else {
+            last;
+        }
+    }
+    my str $indent = "";
+    if ($indent_len > 0) {
+        $indent = substr($first, 0, $indent_len);
+    }
+
+    # Join all paragraph lines into one string, stripping leading whitespace
+    my str $text = "";
+    my int $li = $para_start;
+    while ($li <= $para_end) {
+        my str $line = get_line($li);
+        # Strip leading whitespace
+        my int $si = 0;
+        while ($si < length($line)) {
+            my str $sc = substr($line, $si, 1);
+            if ($sc eq " " || $sc eq "\t") {
+                $si = $si + 1;
+            } else {
+                last;
+            }
+        }
+        my str $stripped = "";
+        if ($si < length($line)) {
+            $stripped = substr($line, $si);
+        }
+        if (length($text) > 0 && length($stripped) > 0) {
+            $text = $text . " " . $stripped;
+        } else {
+            $text = $text . $stripped;
+        }
+        $li = $li + 1;
+    }
+
+    if (length($text) == 0) { return; }
+
+    undo_save();
+
+    # Reflow text into lines of at most $FILL_COLUMN width
+    my int $fill = $FILL_COLUMN - length($indent);
+    if ($fill < 10) { $fill = 10; }
+
+    my scalar $new_lines = [];
+    my str $cur_line = "";
+    my int $pos = 0;
+    my int $tlen = length($text);
+
+    while ($pos < $tlen) {
+        # Extract next word
+        # Skip spaces
+        while ($pos < $tlen && substr($text, $pos, 1) eq " ") {
+            $pos = $pos + 1;
+        }
+        if ($pos >= $tlen) { last; }
+        my int $word_start = $pos;
+        while ($pos < $tlen && substr($text, $pos, 1) ne " ") {
+            $pos = $pos + 1;
+        }
+        my str $word = substr($text, $word_start, $pos - $word_start);
+
+        if (length($cur_line) == 0) {
+            $cur_line = $word;
+        } elsif (length($cur_line) + 1 + length($word) <= $fill) {
+            $cur_line = $cur_line . " " . $word;
+        } else {
+            push(@$new_lines, $indent . $cur_line);
+            $cur_line = $word;
+        }
+    }
+    if (length($cur_line) > 0) {
+        push(@$new_lines, $indent . $cur_line);
+    }
+
+    # Replace paragraph lines with reflowed lines
+    # Delete old paragraph lines
+    my int $di = $para_end;
+    while ($di >= $para_start) {
+        delete_line($di);
+        $di = $di - 1;
+    }
+    # If we deleted all lines and buffer is empty, handle edge case
+    if (line_count() == 0 || (line_count() == 1 && length(get_line(0)) == 0 && $para_start == 0)) {
+        # Buffer had only this paragraph
+        if (line_count() == 0) {
+            insert_line(0, "");
+        }
+        my int $ni = 0;
+        while ($ni < scalar(@$new_lines)) {
+            if ($ni == 0) {
+                set_line(0, $new_lines->[$ni]);
+            } else {
+                insert_line($ni, $new_lines->[$ni]);
+            }
+            $ni = $ni + 1;
+        }
+    } else {
+        # Insert new lines at para_start
+        my int $ni = 0;
+        while ($ni < scalar(@$new_lines)) {
+            insert_line($para_start + $ni, $new_lines->[$ni]);
+            $ni = $ni + 1;
+        }
+    }
+
+    $DIRTY = 1;
+    $CY = $para_start + scalar(@$new_lines) - 1;
+    $CX = length(get_line($CY));
+    set_msg("Filled paragraph (column " . $FILL_COLUMN . ").");
+}
+
+func edit_tab() void {
+    undo_save();
+    if ($INDENT_TABS == 1) {
+        edit_insert("\t");
+    } else {
+        my int $i = 0;
+        while ($i < $TAB_WIDTH) {
+            edit_insert(" ");
+            $i = $i + 1;
+        }
+    }
+}
+
+func undo_save() void {
+    my scalar $snap = {};
+    $snap->{"cy"} = $CY;
+    $snap->{"cx"} = $CX;
+    # Deep copy lines
+    my scalar $copy = [];
+    my int $i = 0;
+    my int $n = line_count();
+    while ($i < $n) {
+        push(@$copy, get_line($i));
+        $i = $i + 1;
+    }
+    $snap->{"lines"} = $copy;
+    push(@$UNDO, $snap);
+    # Trim oldest entries if over limit
+    while (scalar(@$UNDO) > $UNDO_MAX) {
+        shift(@$UNDO);
+    }
+}
+
+func edit_undo() void {
+    if (scalar(@$UNDO) == 0) {
+        set_msg("No further undo information.");
+        return;
+    }
+    my scalar $snap = pop(@$UNDO);
+    $CY = $snap->{"cy"};
+    $CX = $snap->{"cx"};
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"lines"} = $snap->{"lines"};
+    $CL = $snap->{"lines"};
+    $DIRTY = 1;
+    set_msg("Undo.");
+}
+
+# ===========================================================================
+# Directory Listing and Path Helpers
+# ===========================================================================
+
+func list_dir(str $path) array {
+    my array @entries = ();
+    my scalar $dh = core::opendir($path);
+    if (!defined($dh)) { return @entries; }
+    my str $name = core::readdir_next($dh);
+    while (defined($name)) {
+        my str $full = $path . "/" . $name;
+        if (core::is_dir($full) == 1) {
+            push(@entries, $name . "/");
+        } else {
+            push(@entries, $name);
+        }
+        $name = core::readdir_next($dh);
+    }
+    core::closedir($dh);
+    return @entries;
+}
+
+func is_directory(str $path) int {
+    return core::is_dir($path);
+}
+
+func file_exists(str $path) int {
+    return core::file_exists($path);
+}
+
+func path_dirname(str $path) str {
+    my int $last_slash = -1;
+    my int $i = 0;
+    while ($i < length($path)) {
+        if (substr($path, $i, 1) eq "/") {
+            $last_slash = $i;
+        }
+        $i = $i + 1;
+    }
+    if ($last_slash == -1) { return "."; }
+    if ($last_slash == 0) { return "/"; }
+    return substr($path, 0, $last_slash);
+}
+
+func path_basename(str $path) str {
+    my int $last_slash = -1;
+    my int $i = 0;
+    while ($i < length($path)) {
+        if (substr($path, $i, 1) eq "/") {
+            $last_slash = $i;
+        }
+        $i = $i + 1;
+    }
+    if ($last_slash == -1) { return $path; }
+    return substr($path, $last_slash + 1);
+}
+
+# Find common prefix among an array of strings
+func common_prefix(array @strs) str {
+    if (scalar(@strs) == 0) { return ""; }
+    my str $prefix = $strs[0];
+    my int $i = 1;
+    while ($i < scalar(@strs)) {
+        my str $s = $strs[$i];
+        my int $j = 0;
+        my int $max = length($prefix);
+        if (length($s) < $max) { $max = length($s); }
+        while ($j < $max && substr($prefix, $j, 1) eq substr($s, $j, 1)) {
+            $j = $j + 1;
+        }
+        $prefix = substr($prefix, 0, $j);
+        $i = $i + 1;
+    }
+    return $prefix;
+}
+
+# Get file completions for a partial path
+func complete_file(str $input) array {
+    my array @matches = ();
+    if (length($input) == 0) {
+        $input = "./";
+    }
+
+    my str $dir = "";
+    my str $prefix = "";
+
+    # If input ends with /, list that directory
+    if (substr($input, length($input) - 1, 1) eq "/") {
+        $dir = $input;
+        $prefix = "";
+    } else {
+        $dir = path_dirname($input);
+        $prefix = path_basename($input);
+        if (substr($dir, length($dir) - 1, 1) ne "/") {
+            $dir = $dir . "/";
+        }
+    }
+
+    my array @entries = list_dir($dir);
+    my int $i = 0;
+    while ($i < scalar(@entries)) {
+        my str $entry = $entries[$i];
+        if (length($prefix) == 0 || substr($entry, 0, length($prefix)) eq $prefix) {
+            push(@matches, $dir . $entry);
+        }
+        $i = $i + 1;
+    }
+    return @matches;
+}
+
+# Get buffer name completions
+func complete_buffer(str $input) array {
+    my array @matches = ();
+    my int $i = 0;
+    while ($i < scalar(@$BUFFERS)) {
+        my scalar $b = $BUFFERS->[$i];
+        my str $name = $b->{"name"};
+        if (length($input) == 0 || substr($name, 0, length($input)) eq $input) {
+            push(@matches, $name);
+        }
+        $i = $i + 1;
+    }
+    return @matches;
+}
+
+# Get M-x command completions
+func complete_mx(str $input) array {
+    my array @cmds = ("replace-regexp", "refresh-buffer", "revert-buffer",
+        "query-replace", "replace-string", "goto-line", "set-syntax",
+        "load-vim-syntax", "what-cursor-position", "kill-buffer",
+        "find-file", "switch-buffer", "list-buffers",
+        "line-numbers-mode", "which-function-mode",
+        "indent-tabs-mode", "set-tab-width",
+        "tabify", "untabify", "count-words", "count-lines",
+        "fill-paragraph", "set-fill-column",
+        "text-mode", "strada-mode", "c-mode", "perl-mode",
+        "python-mode", "javascript-mode", "html-mode", "css-mode",
+        "shell-mode", "makefile-mode", "markdown-mode");
+    my array @matches = ();
+    my int $i = 0;
+    while ($i < scalar(@cmds)) {
+        my str $cmd = $cmds[$i];
+        if (length($input) == 0 || substr($cmd, 0, length($input)) eq $input) {
+            push(@matches, $cmd);
+        }
+        $i = $i + 1;
+    }
+    return @matches;
+}
+
+# ===========================================================================
+# Minibuffer History
+# ===========================================================================
+
+func hist_add(str $cat, str $val) void {
+    if (length($val) == 0) { return; }
+    if (!defined($HISTORY->{$cat})) {
+        $HISTORY->{$cat} = [];
+    }
+    my scalar $list = $HISTORY->{$cat};
+    # Don't add duplicates of the most recent entry
+    my int $n = scalar(@$list);
+    if ($n > 0 && $list->[$n - 1] eq $val) { return; }
+    push(@$list, $val);
+    # Trim to max
+    while (scalar(@$list) > $HIST_MAX) {
+        splice(@$list, 0, 1);
+    }
+}
+
+func hist_get(str $cat) scalar {
+    if (!defined($HISTORY->{$cat})) {
+        return [];
+    }
+    return $HISTORY->{$cat};
+}
+
+# ===========================================================================
+# Minibuffer Input
+# ===========================================================================
+
+# Minibuffer with tab-completion and history
+# $mode: "file", "buffer", "mx", or "" (no completion)
+# $hist_cat: history category name, or "" for no history
+func mb_read_complete_hist(str $prompt, str $mode, str $hist_cat) str {
+    my str $input = "";
+    my int $pos = 0;
+    my int $show_completions = 0;
+    my int $comp_scroll = 0;
+    my str $saved_input = "";  # what user typed before browsing history
+    my int $hist_idx = -1;     # -1 = not browsing, 0..n = index from end
+    my scalar $hist_list = hist_get($hist_cat);
+    my int $hist_len = scalar(@$hist_list);
+
+    while (1) {
+        # Get completions
+        my array @comp_list = ();
+        if (length($mode) > 0) {
+            if ($mode eq "file") {
+                @comp_list = complete_file($input);
+            } elsif ($mode eq "buffer") {
+                @comp_list = complete_buffer($input);
+            } elsif ($mode eq "mx") {
+                @comp_list = complete_mx($input);
+            }
+        }
+
+        # Calculate panel dimensions
+        my int $panel_rows = 0;
+        if ($show_completions == 1 && scalar(@comp_list) > 0) {
+            $panel_rows = $ROWS - 3;
+            if ($panel_rows > scalar(@comp_list) + 1) {
+                $panel_rows = scalar(@comp_list) + 1;
+            }
+            if ($panel_rows < 3) { $panel_rows = 3; }
+        }
+
+        # Redraw editor cleanly
+        render();
+
+        # Overlay completions panel
+        my str $out = "";
+        $out = $out . $E . "[?25l";
+
+        if ($panel_rows > 0) {
+            # Find max entry width
+            my int $max_w = 0;
+            my int $ei = 0;
+            while ($ei < scalar(@comp_list)) {
+                my int $elen = length($comp_list[$ei]);
+                if ($elen > $max_w) { $max_w = $elen; }
+                $ei = $ei + 1;
+            }
+            $max_w = $max_w + 2;
+            if ($max_w < 12) { $max_w = 12; }
+            my int $num_cols = $COLS / $max_w;
+            if ($num_cols < 1) { $num_cols = 1; }
+
+            # Header
+            my int $start_row = $ROWS - 1 - $panel_rows;
+            if ($start_row < 1) { $start_row = 1; }
+            $out = $out . $E . "[" . $start_row . ";1H" . $E . "[K" . $E . "[7m";
+            my str $hdr = " Completions";
+            $out = $out . $hdr;
+            my int $hpad = $COLS - length($hdr);
+            my int $hi = 0;
+            while ($hi < $hpad) { $out = $out . " "; $hi = $hi + 1; }
+            $out = $out . $E . "[0m";
+
+            # Entries in columns
+            my int $data_rows = $panel_rows - 1;
+            my int $total = scalar(@comp_list);
+            my int $visible = $data_rows * $num_cols;
+            if ($comp_scroll > $total - $visible) {
+                $comp_scroll = $total - $visible;
+            }
+            if ($comp_scroll < 0) { $comp_scroll = 0; }
+
+            my int $ri = 0;
+            while ($ri < $data_rows) {
+                my int $screen_row = $start_row + 1 + $ri;
+                $out = $out . $E . "[" . $screen_row . ";1H" . $E . "[K";
+                my int $ci = 0;
+                while ($ci < $num_cols) {
+                    my int $idx = $comp_scroll + $ri + $ci * $data_rows;
+                    if ($idx < $total) {
+                        my str $entry = $comp_list[$idx];
+                        $out = $out . $entry;
+                        my int $pad = $max_w - length($entry);
+                        my int $pi = 0;
+                        while ($pi < $pad) { $out = $out . " "; $pi = $pi + 1; }
+                    }
+                    $ci = $ci + 1;
+                }
+                $ri = $ri + 1;
+            }
+        }
+
+        # Minibuffer line
+        $out = $out . $E . "[" . $ROWS . ";1H" . $E . "[K";
+        my str $disp_input = $input;
+        my int $avail = $COLS - length($prompt) - 1;
+        if (length($disp_input) > $avail && $avail > 3) {
+            my int $skip = length($disp_input) - $avail + 3;
+            $disp_input = "..." . substr($disp_input, $skip);
+        }
+        $out = $out . $prompt . $disp_input;
+        my int $cursor_col = length($prompt) + $pos + 1;
+        if (length($input) > $avail && $avail > 3) {
+            my int $skip = length($input) - $avail + 3;
+            $cursor_col = length($prompt) + 3 + ($pos - $skip) + 1;
+        }
+        $out = $out . $E . "[" . $ROWS . ";" . $cursor_col . "H";
+        $out = $out . $E . "[?25h";
+        core::write_fd(1, $out);
+
+        my str $key = read_key();
+        if (length($key) == 0) { next; }
+
+        if ($key eq "RET") {
+            if ($show_completions == 1 && scalar(@comp_list) == 1) {
+                $input = $comp_list[0];
+            }
+            if ($show_completions == 1) { render(); }
+            if (length($hist_cat) > 0 && length($input) > 0) {
+                hist_add($hist_cat, $input);
+                $hist_list = hist_get($hist_cat);
+                $hist_len = scalar(@$hist_list);
+            }
+            return $input;
+        }
+        if ($key eq "C-g" || $key eq "ESC") {
+            if ($show_completions == 1) { render(); }
+            set_msg("Cancelled.");
+            return "";
+        }
+        # History navigation
+        if (($key eq "UP" || $key eq "C-p") && $show_completions == 0 && length($hist_cat) > 0 && $hist_len > 0) {
+            if ($hist_idx == -1) {
+                $saved_input = $input;
+                $hist_idx = 0;
+            } else {
+                if ($hist_idx < $hist_len - 1) { $hist_idx = $hist_idx + 1; }
+            }
+            $input = $hist_list->[$hist_len - 1 - $hist_idx];
+            $pos = length($input);
+            next;
+        }
+        if (($key eq "UP" || $key eq "C-p") && $show_completions == 1) {
+            if ($comp_scroll > 0) { $comp_scroll = $comp_scroll - 1; }
+            next;
+        }
+        if (($key eq "DOWN" || $key eq "C-n") && $show_completions == 1) {
+            $comp_scroll = $comp_scroll + 1;
+            next;
+        }
+        if (($key eq "DOWN" || $key eq "C-n") && $hist_idx >= 0) {
+            $hist_idx = $hist_idx - 1;
+            if ($hist_idx < 0) {
+                $hist_idx = -1;
+                $input = $saved_input;
+            } else {
+                $input = $hist_list->[$hist_len - 1 - $hist_idx];
+            }
+            $pos = length($input);
+            next;
+        }
+        if ($key eq "TAB" && length($mode) > 0) {
+            if (scalar(@comp_list) == 0) {
+                set_msg("[No match]");
+            } elsif (scalar(@comp_list) == 1) {
+                $input = $comp_list[0];
+                $pos = length($input);
+                $show_completions = 0;
+            } else {
+                my str $cp = common_prefix(@comp_list);
+                if (length($cp) > length($input)) {
+                    $input = $cp;
+                    $pos = length($input);
+                }
+                $show_completions = 1;
+                $comp_scroll = 0;
+            }
+            next;
+        }
+        # Hide panel on non-navigation keys
+        if ($show_completions == 1 && $key ne "TAB" && $key ne "UP" && $key ne "DOWN" && $key ne "C-p" && $key ne "C-n") {
+            $show_completions = 0;
+        }
+        if ($key eq "BACKSPACE" || $key eq "C-h") {
+            if ($pos > 0) {
+                $input = substr($input, 0, $pos - 1) . substr($input, $pos);
+                $pos = $pos - 1;
+            }
+            next;
+        }
+        if ($key eq "C-a") { $pos = 0; next; }
+        if ($key eq "C-e") { $pos = length($input); next; }
+        if ($key eq "LEFT" || $key eq "C-b") {
+            if ($pos > 0) { $pos = $pos - 1; }
+            next;
+        }
+        if ($key eq "RIGHT" || $key eq "C-f") {
+            if ($pos < length($input)) { $pos = $pos + 1; }
+            next;
+        }
+        if ($key eq "C-k") { $input = substr($input, 0, $pos); next; }
+        if ($key eq "M-BACKSPACE") {
+            if ($pos > 0) {
+                my int $end = $pos;
+                while ($pos > 0 && is_word_char(substr($input, $pos - 1, 1)) == 0) {
+                    $pos = $pos - 1;
+                }
+                while ($pos > 0 && is_word_char(substr($input, $pos - 1, 1)) == 1) {
+                    $pos = $pos - 1;
+                }
+                my str $bef = "";
+                if ($pos > 0) { $bef = substr($input, 0, $pos); }
+                my str $aft = "";
+                if ($end < length($input)) { $aft = substr($input, $end); }
+                $input = $bef . $aft;
+            }
+            next;
+        }
+        # Insert printable character
+        if (length($key) == 1) {
+            my int $code = ord($key);
+            if ($code >= 32 && $code <= 126) {
+                my str $before = "";
+                if ($pos > 0) { $before = substr($input, 0, $pos); }
+                my str $after = "";
+                if ($pos < length($input)) { $after = substr($input, $pos); }
+                $input = $before . $key . $after;
+                $pos = $pos + 1;
+            }
+        }
+    }
+    return "";
+}
+
+func mb_read_with_complete(str $prompt, str $mode) str {
+    return mb_read_complete_hist($prompt, $mode, $mode);
+}
+
+func mb_read(str $prompt) str {
+    return mb_read_complete_hist($prompt, "", "general");
+}
+
+func mb_read_yn(str $prompt) int {
+    my str $out = "";
+    $out = $out . $E . "[" . $ROWS . ";1H";
+    $out = $out . $E . "[K";
+    $out = $out . $prompt . " (y/n) ";
+    core::write_fd(1, $out);
+
+    while (1) {
+        my str $key = read_key();
+        if ($key eq "y" || $key eq "Y") { return 1; }
+        if ($key eq "n" || $key eq "N") { return 0; }
+        if ($key eq "C-g" || $key eq "ESC") { return -1; }
+    }
+    return 0;
+}
+
+# ===========================================================================
+# Search
+# ===========================================================================
+
+func cmd_isearch() void {
+    my str $query = "";
+    my int $orig_cy = $CY;
+    my int $orig_cx = $CX;
+    my int $orig_sy = $SY;
+    my int $dir = 1;
+
+    while (1) {
+        # Render with search info
+        render();
+
+        # Highlight the current match in the buffer
+        my str $out = "";
+        if (length($query) > 0) {
+            my int $gutter = linum_width();
+            my int $msy = $CY - $SY;
+            my int $msx = $CX - $SX;
+            if ($msy >= 0 && $msy < $EDIT_ROWS && $msx >= 0) {
+                my str $hl = $E . "[1;33;44m";
+                my str $rst = $E . "[0m";
+                my str $mline = get_line($CY);
+                my int $qlen = length($query);
+                my int $mlen = length($mline);
+                my int $mi = 0;
+                while ($mi < $qlen && $CX + $mi < $mlen) {
+                    my int $scol = $msx + $mi;
+                    if ($scol >= 0 && $scol < $COLS) {
+                        my str $mch = substr($mline, $CX + $mi, 1);
+                        my int $mrow = $msy + 1;
+                        my int $mcol = $scol + 1 + $gutter;
+                        $out = $out . $E . "[" . $mrow . ";" . $mcol . "H" . $hl . $mch . $rst;
+                    }
+                    $mi = $mi + 1;
+                }
+            }
+        }
+
+        my str $prompt = "I-search: ";
+        if ($dir == -1) {
+            $prompt = "I-search backward: ";
+        }
+        $out = $out . $E . "[" . $ROWS . ";1H";
+        $out = $out . $E . "[K";
+        $out = $out . $prompt . $query;
+        core::write_fd(1, $out);
+
+        my str $key = read_key();
+        if (length($key) == 0) {
+            next;
+        }
+        if ($key eq "RET" || $key eq "ESC") {
+            set_msg("Search done.");
+            return;
+        }
+        if ($key eq "C-g") {
+            $CY = $orig_cy;
+            $CX = $orig_cx;
+            $SY = $orig_sy;
+            set_msg("Search cancelled.");
+            return;
+        }
+        if ($key eq "C-s") {
+            $dir = 1;
+            search_next($query, $dir, 1);
+            next;
+        }
+        if ($key eq "C-r") {
+            $dir = -1;
+            search_next($query, $dir, 1);
+            next;
+        }
+        if ($key eq "BACKSPACE" || $key eq "C-h") {
+            if (length($query) > 0) {
+                $query = substr($query, 0, length($query) - 1);
+            }
+            # Reset to start and search again
+            $CY = $orig_cy;
+            $CX = $orig_cx;
+            if (length($query) > 0) {
+                search_next($query, $dir, 0);
+            }
+            next;
+        }
+        # Printable chars
+        if (length($key) == 1) {
+            my int $code = ord($key);
+            if ($code >= 32 && $code <= 126) {
+                $query = $query . $key;
+                search_next($query, $dir, 0);
+            }
+        }
+    }
+}
+
+func search_next(str $query, int $dir, int $advance) void {
+    if (length($query) == 0) { return; }
+    my int $n = line_count();
+    my int $start_y = $CY;
+    my int $start_x = $CX;
+
+    if ($dir == 1) {
+        # Forward search
+        my int $y = $start_y;
+        my int $x = $start_x + $advance;
+        while ($y < $n) {
+            my str $line = get_line($y);
+            my int $pos = index(substr($line, $x), $query);
+            if ($pos >= 0) {
+                $CY = $y;
+                $CX = $x + $pos;
+                scroll_adjust();
+                return;
+            }
+            $y = $y + 1;
+            $x = 0;
+        }
+        # Wrap around
+        $y = 0;
+        while ($y <= $start_y) {
+            my str $line = get_line($y);
+            my int $max_x = length($line);
+            if ($y == $start_y) { $max_x = $start_x; }
+            my int $pos = index($line, $query);
+            if ($pos >= 0 && $pos < $max_x) {
+                $CY = $y;
+                $CX = $pos;
+                scroll_adjust();
+                set_msg("Wrapped.");
+                return;
+            }
+            $y = $y + 1;
+        }
+        set_msg("Not found: " . $query);
+    } else {
+        # Backward search
+        my int $y = $start_y;
+        my int $x = $start_x - 1;
+        while ($y >= 0) {
+            if ($x >= 0) {
+                my str $line = get_line($y);
+                my str $region = substr($line, 0, $x + 1);
+                my int $pos = -1;
+                my int $search_from = 0;
+                while (1) {
+                    my int $found = index(substr($region, $search_from), $query);
+                    if ($found == -1) { last; }
+                    $pos = $search_from + $found;
+                    $search_from = $pos + 1;
+                }
+                if ($pos >= 0) {
+                    $CY = $y;
+                    $CX = $pos;
+                    scroll_adjust();
+                    return;
+                }
+            }
+            $y = $y - 1;
+            if ($y >= 0) {
+                $x = length(get_line($y));
+            }
+        }
+        set_msg("Not found: " . $query);
+    }
+}
+
+# ===========================================================================
+# Replace
+# ===========================================================================
+
+func cmd_query_replace() void {
+    my str $search = mb_read_complete_hist("Query replace: ", "", "search");
+    if (length($search) == 0) { return; }
+    my str $repl = mb_read_complete_hist("Replace with: ", "", "replace");
+
+    my int $count = 0;
+    my int $y = $CY;
+    my int $x = $CX;
+
+    while ($y < line_count()) {
+        my str $line = get_line($y);
+        my int $pos = index(substr($line, $x), $search);
+        if ($pos >= 0) {
+            $CY = $y;
+            $CX = $x + $pos;
+            render();
+
+            my str $out = "";
+            $out = $out . $E . "[" . $ROWS . ";1H";
+            $out = $out . $E . "[K";
+            $out = $out . "Replace? (y/n/!/q) ";
+            core::write_fd(1, $out);
+
+            my str $key = "";
+            while (length($key) == 0) {
+                $key = read_key();
+            }
+
+            if ($key eq "q" || $key eq "C-g" || $key eq "ESC") {
+                set_msg("Replaced " . $count . " occurrences.");
+                return;
+            }
+            if ($key eq "!") {
+                # Replace all remaining
+                while ($y < line_count()) {
+                    $line = get_line($y);
+                    $pos = index(substr($line, $x), $search);
+                    if ($pos >= 0) {
+                        my int $real_pos = $x + $pos;
+                        my str $before = "";
+                        if ($real_pos > 0) { $before = substr($line, 0, $real_pos); }
+                        my str $after = "";
+                        if ($real_pos + length($search) < length($line)) {
+                            $after = substr($line, $real_pos + length($search));
+                        }
+                        set_line($y, $before . $repl . $after);
+                        $x = $real_pos + length($repl);
+                        $count = $count + 1;
+                    } else {
+                        $y = $y + 1;
+                        $x = 0;
+                    }
+                }
+                $DIRTY = 1;
+                set_msg("Replaced " . $count . " occurrences.");
+                return;
+            }
+            if ($key eq "y" || $key eq "Y") {
+                my int $real_pos = $x + $pos;
+                my str $before = "";
+                if ($real_pos > 0) { $before = substr($line, 0, $real_pos); }
+                my str $after = "";
+                if ($real_pos + length($search) < length($line)) {
+                    $after = substr($line, $real_pos + length($search));
+                }
+                set_line($y, $before . $repl . $after);
+                $x = $real_pos + length($repl);
+                $count = $count + 1;
+                $DIRTY = 1;
+            } else {
+                # Skip (n or anything else)
+                $x = $x + $pos + length($search);
+            }
+        } else {
+            $y = $y + 1;
+            $x = 0;
+        }
+    }
+    set_msg("Replaced " . $count . " occurrences.");
+}
+
+func cmd_replace_regexp() void {
+    my str $pattern = mb_read_complete_hist("Replace regexp: ", "", "search");
+    if (length($pattern) == 0) { return; }
+    my str $repl = mb_read_complete_hist("Replace with: ", "", "replace");
+
+    my int $count = 0;
+    my int $y = $CY;
+    while ($y < line_count()) {
+        my str $line = get_line($y);
+        my str $new_line = replace($line, $pattern, $repl);
+        while ($new_line ne $line) {
+            $line = $new_line;
+            $new_line = replace($line, $pattern, $repl);
+        }
+        if ($new_line ne get_line($y)) {
+            set_line($y, $new_line);
+            $count = $count + 1;
+            $DIRTY = 1;
+        }
+        $y = $y + 1;
+    }
+    set_msg("Replaced in " . $count . " lines.");
+}
+
+# ===========================================================================
+# M-x Commands
+# ===========================================================================
+
+func cmd_mx() void {
+    my str $cmd = mb_read_with_complete("M-x ", "mx");
+    if (length($cmd) == 0) { return; }
+
+    if ($cmd eq "replace-regexp") {
+        cmd_replace_regexp();
+        return;
+    }
+    if ($cmd eq "refresh-buffer" || $cmd eq "revert-buffer") {
+        if (length($FNAME) == 0) {
+            set_msg("Buffer has no file.");
+            return;
+        }
+        if ($DIRTY == 1) {
+            my int $yn = mb_read_yn("Buffer modified; revert?");
+            if ($yn != 1) {
+                set_msg("Revert cancelled.");
+                return;
+            }
+        }
+        file_open($FNAME);
+        set_msg("Refreshed from: " . $FNAME);
+        return;
+    }
+    if ($cmd eq "query-replace" || $cmd eq "replace-string") {
+        cmd_query_replace();
+        return;
+    }
+    if ($cmd eq "goto-line") {
+        my str $linestr = mb_read("Goto line: ");
+        if (length($linestr) > 0) {
+            my int $target = core::atoi($linestr);
+            if ($target > 0) {
+                $CY = $target - 1;
+                $CX = 0;
+                clamp_cursor();
+            }
+        }
+        return;
+    }
+    if ($cmd eq "set-syntax") {
+        my str $lang = mb_read("Syntax language (c/perl/strada/none): ");
+        if ($lang eq "none") {
+            set_mode("Text");
+        } else {
+            my str $m = mode_for_syntax($lang);
+            $SYNTAX = $lang;
+            $MODE = $m;
+            my scalar $buf = $BUFFERS->[$BUF_IDX];
+            $buf->{"syntax"} = $SYNTAX;
+            $buf->{"mode"} = $MODE;
+            set_msg($m . " mode (" . $lang . ")");
+        }
+        return;
+    }
+    if ($cmd eq "load-vim-syntax") {
+        my str $path = mb_read("Vim syntax file: ");
+        if (length($path) > 0) {
+            vim_syntax_load($path);
+        }
+        return;
+    }
+    if ($cmd eq "what-cursor-position") {
+        my str $line = get_line($CY);
+        if ($CX < length($line)) {
+            my str $ch = substr($line, $CX, 1);
+            my int $code = ord($ch);
+            set_msg("Char: " . $ch . " (" . $code . ") Line " . ($CY + 1) . " Col " . ($CX + 1));
+        } else {
+            set_msg("End of line. Line " . ($CY + 1) . " Col " . ($CX + 1));
+        }
+        return;
+    }
+    if ($cmd eq "kill-buffer") {
+        cmd_kill_buffer();
+        return;
+    }
+    if ($cmd eq "find-file") {
+        cmd_find_file();
+        return;
+    }
+    if ($cmd eq "switch-buffer") {
+        cmd_switch_buffer();
+        return;
+    }
+    if ($cmd eq "list-buffers") {
+        cmd_list_buffers();
+        return;
+    }
+    if ($cmd eq "line-numbers-mode") {
+        if ($LINUM == 0) {
+            $LINUM = 1;
+            set_msg("Line numbers enabled.");
+        } else {
+            $LINUM = 0;
+            set_msg("Line numbers disabled.");
+        }
+        return;
+    }
+    if ($cmd eq "which-function-mode") {
+        if ($WHICH_FUNC == 0) {
+            $WHICH_FUNC = 1;
+            set_msg("Which-function mode enabled.");
+        } else {
+            $WHICH_FUNC = 0;
+            set_msg("Which-function mode disabled.");
+        }
+        return;
+    }
+    if ($cmd eq "indent-tabs-mode") {
+        if ($INDENT_TABS == 0) {
+            $INDENT_TABS = 1;
+            set_msg("Indent with tabs.");
+        } else {
+            $INDENT_TABS = 0;
+            set_msg("Indent with spaces (" . $TAB_WIDTH . ").");
+        }
+        return;
+    }
+    if ($cmd eq "set-tab-width") {
+        my str $val = mb_read("Tab width (1-16): ");
+        if (length($val) > 0) {
+            my int $tw = core::atoi($val);
+            if ($tw > 0 && $tw <= 16) {
+                $TAB_WIDTH = $tw;
+                set_msg("Tab width set to " . $tw . ".");
+            } else {
+                set_msg("Invalid tab width.");
+            }
+        }
+        return;
+    }
+    if ($cmd eq "tabify") {
+        # Convert leading spaces to tabs in entire buffer
+        undo_save();
+        my int $li = 0;
+        my int $converted = 0;
+        while ($li < line_count()) {
+            my str $line = get_line($li);
+            my str $new_line = "";
+            my int $ci = 0;
+            my int $spaces = 0;
+            # Count and convert leading spaces
+            while ($ci < length($line) && substr($line, $ci, 1) eq " ") {
+                $spaces = $spaces + 1;
+                if ($spaces == $TAB_WIDTH) {
+                    $new_line = $new_line . "\t";
+                    $spaces = 0;
+                    $converted = $converted + 1;
+                }
+                $ci = $ci + 1;
+            }
+            # Add remaining spaces
+            my int $si = 0;
+            while ($si < $spaces) {
+                $new_line = $new_line . " ";
+                $si = $si + 1;
+            }
+            # Add rest of line
+            if ($ci < length($line)) {
+                $new_line = $new_line . substr($line, $ci);
+            }
+            set_line($li, $new_line);
+            $li = $li + 1;
+        }
+        if ($converted > 0) { $DIRTY = 1; }
+        set_msg("Tabified: " . $converted . " tab stops converted.");
+        return;
+    }
+    if ($cmd eq "untabify") {
+        # Convert tabs to spaces in entire buffer
+        undo_save();
+        my int $li = 0;
+        my int $converted = 0;
+        while ($li < line_count()) {
+            my str $line = get_line($li);
+            if (index($line, "\t") >= 0) {
+                my str $spaces = "";
+                my int $si = 0;
+                while ($si < $TAB_WIDTH) {
+                    $spaces = $spaces . " ";
+                    $si = $si + 1;
+                }
+                my str $new_line = "";
+                my int $ci = 0;
+                while ($ci < length($line)) {
+                    my str $ch = substr($line, $ci, 1);
+                    if ($ch eq "\t") {
+                        $new_line = $new_line . $spaces;
+                        $converted = $converted + 1;
+                    } else {
+                        $new_line = $new_line . $ch;
+                    }
+                    $ci = $ci + 1;
+                }
+                set_line($li, $new_line);
+            }
+            $li = $li + 1;
+        }
+        if ($converted > 0) { $DIRTY = 1; }
+        set_msg("Untabified: " . $converted . " tabs converted to " . $TAB_WIDTH . " spaces each.");
+        return;
+    }
+
+    if ($cmd eq "fill-paragraph") {
+        fill_paragraph();
+        return;
+    }
+    if ($cmd eq "set-fill-column") {
+        my str $val = mb_read("Fill column (default " . $FILL_COLUMN . "): ");
+        if (length($val) > 0) {
+            my int $fc = core::atoi($val);
+            if ($fc > 0 && $fc <= 1000) {
+                $FILL_COLUMN = $fc;
+                set_msg("Fill column set to " . $fc . ".");
+            } else {
+                set_msg("Invalid fill column.");
+            }
+        }
+        return;
+    }
+
+    # Major mode commands: *-mode
+    if ($cmd eq "text-mode") { set_mode("Text"); return; }
+    if ($cmd eq "count-words") {
+        my int $words = 0;
+        my int $chars = 0;
+        my int $li = 0;
+        my int $lines = line_count();
+        while ($li < $lines) {
+            my str $line = get_line($li);
+            my int $len = length($line);
+            my int $pos = 0;
+            my int $in_word = 0;
+            while ($pos < $len) {
+                my str $ch = u8_char_at($line, $pos);
+                $chars = $chars + 1;
+                if (is_word_char($ch) == 1) {
+                    if ($in_word == 0) {
+                        $words = $words + 1;
+                        $in_word = 1;
+                    }
+                } else {
+                    $in_word = 0;
+                }
+                $pos = u8_next($line, $pos);
+            }
+            $li = $li + 1;
+        }
+        set_msg("Lines: " . $lines . "  Words: " . $words . "  Chars: " . $chars);
+        return;
+    }
+    if ($cmd eq "count-lines") {
+        set_msg("Buffer has " . line_count() . " lines.");
+        return;
+    }
+    if ($cmd eq "strada-mode") { set_mode("Strada"); return; }
+    if ($cmd eq "c-mode") { set_mode("C"); return; }
+    if ($cmd eq "perl-mode") { set_mode("Perl"); return; }
+    if ($cmd eq "python-mode") { set_mode("Python"); return; }
+    if ($cmd eq "javascript-mode") { set_mode("JavaScript"); return; }
+    if ($cmd eq "html-mode") { set_mode("HTML"); return; }
+    if ($cmd eq "css-mode") { set_mode("CSS"); return; }
+    if ($cmd eq "shell-mode") { set_mode("Shell"); return; }
+    if ($cmd eq "makefile-mode") { set_mode("Makefile"); return; }
+    if ($cmd eq "markdown-mode") { set_mode("Markdown"); return; }
+
+    set_msg("Unknown command: " . $cmd);
+}
+
+# ===========================================================================
+# Buffer Commands
+# ===========================================================================
+
+# Emacs-style file finder with completions panel
+func mb_read_file(str $prompt) str {
+    # Start with current directory
+    my str $input = core::getcwd() . "/";
+    my int $pos = length($input);
+    my int $show_completions = 1;
+    my int $comp_scroll = 0;
+
+    while (1) {
+        # Get completions for current input
+        my array @comp_list = complete_file($input);
+
+        # Calculate completions panel dimensions
+        my int $panel_rows = 0;
+        if ($show_completions == 1 && scalar(@comp_list) > 0) {
+            $panel_rows = $ROWS - 3;  # leave room for status bar + minibuffer + header
+            if ($panel_rows > scalar(@comp_list) + 1) {
+                $panel_rows = scalar(@comp_list) + 1;
+            }
+            if ($panel_rows < 3) { $panel_rows = 3; }
+        }
+
+        # First render the full editor to get a clean screen
+        render();
+
+        # Now overlay the completions panel
+        my str $out = "";
+        $out = $out . $E . "[?25l";
+
+        if ($panel_rows > 0) {
+            # Determine directory prefix to strip for display names
+            my str $strip_dir = $input;
+            if (length($strip_dir) > 0 && substr($strip_dir, length($strip_dir) - 1, 1) ne "/") {
+                $strip_dir = path_dirname($strip_dir);
+                if (substr($strip_dir, length($strip_dir) - 1, 1) ne "/") {
+                    $strip_dir = $strip_dir . "/";
+                }
+            }
+            # Find max entry width for column layout
+            my int $max_w = 0;
+            my int $ei = 0;
+            while ($ei < scalar(@comp_list)) {
+                my str $ename = $comp_list[$ei];
+                if (length($ename) > length($strip_dir) && substr($ename, 0, length($strip_dir)) eq $strip_dir) {
+                    $ename = substr($ename, length($strip_dir));
+                }
+                if (length($ename) > $max_w) { $max_w = length($ename); }
+                $ei = $ei + 1;
+            }
+            $max_w = $max_w + 2;  # padding
+            if ($max_w < 12) { $max_w = 12; }
+            my int $num_cols = $COLS / $max_w;
+            if ($num_cols < 1) { $num_cols = 1; }
+
+            # Header line
+            my int $start_row = $ROWS - 1 - $panel_rows;
+            if ($start_row < 1) { $start_row = 1; }
+            $out = $out . $E . "[" . $start_row . ";1H";
+            $out = $out . $E . "[K";
+            $out = $out . $E . "[7m";
+            my str $hdr = " Completions";
+            my int $hpad = $COLS - length($hdr);
+            $out = $out . $hdr;
+            my int $hi = 0;
+            while ($hi < $hpad) {
+                $out = $out . " ";
+                $hi = $hi + 1;
+            }
+            $out = $out . $E . "[0m";
+
+            # Entries in columns
+            my int $data_rows = $panel_rows - 1;  # minus header
+            my int $total = scalar(@comp_list);
+
+            # Clamp scroll
+            my int $visible = $data_rows * $num_cols;
+            if ($comp_scroll > $total - $visible) {
+                $comp_scroll = $total - $visible;
+            }
+            if ($comp_scroll < 0) { $comp_scroll = 0; }
+
+            my int $ri = 0;
+            while ($ri < $data_rows) {
+                my int $screen_row = $start_row + 1 + $ri;
+                $out = $out . $E . "[" . $screen_row . ";1H";
+                $out = $out . $E . "[K";
+
+                my int $ci = 0;
+                while ($ci < $num_cols) {
+                    my int $idx = $comp_scroll + $ri + $ci * $data_rows;
+                    if ($idx < $total) {
+                        my str $entry = $comp_list[$idx];
+                        if (length($entry) > length($strip_dir) && substr($entry, 0, length($strip_dir)) eq $strip_dir) {
+                            $entry = substr($entry, length($strip_dir));
+                        }
+                        my str $full = $comp_list[$idx];
+                        # Color: directories in blue+bold, files normal
+                        my int $is_dir = 0;
+                        if (length($entry) > 0 && substr($entry, length($entry) - 1, 1) eq "/") {
+                            $is_dir = 1;
+                        }
+                        if ($is_dir == 1) {
+                            $out = $out . $E . "[1;34m";
+                        }
+                        $out = $out . $entry;
+                        if ($is_dir == 1) {
+                            $out = $out . $E . "[0m";
+                        }
+                        # Pad to column width
+                        my int $pad = $max_w - length($entry);
+                        my int $pi = 0;
+                        while ($pi < $pad) {
+                            $out = $out . " ";
+                            $pi = $pi + 1;
+                        }
+                    }
+                    $ci = $ci + 1;
+                }
+                $ri = $ri + 1;
+            }
+        }
+
+        # Minibuffer line
+        $out = $out . $E . "[" . $ROWS . ";1H";
+        $out = $out . $E . "[K";
+        my str $disp_prompt = $prompt;
+        my str $disp_input = $input;
+        # Truncate input display from the left if too long
+        my int $avail = $COLS - length($disp_prompt) - 1;
+        if (length($disp_input) > $avail && $avail > 3) {
+            my int $skip = length($disp_input) - $avail + 3;
+            $disp_input = "..." . substr($disp_input, $skip);
+        }
+        $out = $out . $disp_prompt . $disp_input;
+        # Position cursor in minibuffer
+        my int $cursor_col = length($disp_prompt) + $pos + 1;
+        if (length($input) > $avail && $avail > 3) {
+            my int $skip = length($input) - $avail + 3;
+            $cursor_col = length($disp_prompt) + 3 + ($pos - $skip) + 1;
+        }
+        $out = $out . $E . "[" . $ROWS . ";" . $cursor_col . "H";
+        $out = $out . $E . "[?25h";
+        core::write_fd(1, $out);
+
+        my str $key = read_key();
+        if (length($key) == 0) {
+            next;
+        }
+
+        if ($key eq "RET") {
+            # If only one match and input ends with /, auto-complete
+            if (scalar(@comp_list) == 1) {
+                $input = $comp_list[0];
+            }
+            # Clear completions area
+            if ($show_completions == 1) {
+                render();
+            }
+            if (length($input) > 0) {
+                hist_add("file", $input);
+            }
+            return $input;
+        }
+        if ($key eq "C-g" || $key eq "ESC") {
+            if ($show_completions == 1) {
+                render();
+            }
+            set_msg("Cancelled.");
+            return "";
+        }
+        if ($key eq "TAB") {
+            if (scalar(@comp_list) == 0) {
+                set_msg("[No match]");
+            } elsif (scalar(@comp_list) == 1) {
+                $input = $comp_list[0];
+                $pos = length($input);
+            } else {
+                # Extend to common prefix
+                my str $cp = common_prefix(@comp_list);
+                if (length($cp) > length($input)) {
+                    $input = $cp;
+                    $pos = length($input);
+                }
+                $show_completions = 1;
+                $comp_scroll = 0;
+            }
+            next;
+        }
+        if ($key eq "BACKSPACE" || $key eq "C-h") {
+            if ($pos > 0) {
+                $input = substr($input, 0, $pos - 1) . substr($input, $pos);
+                $pos = $pos - 1;
+            }
+            next;
+        }
+        if ($key eq "M-BACKSPACE") {
+            if ($pos > 0) {
+                my int $end = $pos;
+                while ($pos > 0 && is_word_char(substr($input, $pos - 1, 1)) == 0) {
+                    $pos = $pos - 1;
+                }
+                while ($pos > 0 && is_word_char(substr($input, $pos - 1, 1)) == 1) {
+                    $pos = $pos - 1;
+                }
+                my str $bef = "";
+                if ($pos > 0) { $bef = substr($input, 0, $pos); }
+                my str $aft = "";
+                if ($end < length($input)) { $aft = substr($input, $end); }
+                $input = $bef . $aft;
+            }
+            next;
+        }
+        if ($key eq "C-a") {
+            $pos = 0;
+            next;
+        }
+        if ($key eq "C-e") {
+            $pos = length($input);
+            next;
+        }
+        if ($key eq "LEFT" || $key eq "C-b") {
+            if ($pos > 0) { $pos = $pos - 1; }
+            next;
+        }
+        if ($key eq "RIGHT" || $key eq "C-f") {
+            if ($pos < length($input)) { $pos = $pos + 1; }
+            next;
+        }
+        if ($key eq "C-k") {
+            $input = substr($input, 0, $pos);
+            next;
+        }
+        # History
+        if ($key eq "UP" || $key eq "C-p") {
+            if ($show_completions == 1 && $comp_scroll > 0) {
+                $comp_scroll = $comp_scroll - 1;
+            } else {
+                # History browse
+                my scalar $hl = hist_get("file");
+                my int $hln = scalar(@$hl);
+                if ($hln > 0) {
+                    $input = $hl->[$hln - 1];
+                    $pos = length($input);
+                }
+            }
+            next;
+        }
+        if ($key eq "DOWN" || $key eq "C-n") {
+            if ($show_completions == 1) {
+                $comp_scroll = $comp_scroll + 1;
+            }
+            next;
+        }
+        # Insert printable character
+        if (length($key) == 1) {
+            my int $code = ord($key);
+            if ($code >= 32 && $code <= 126) {
+                my str $before = "";
+                if ($pos > 0) { $before = substr($input, 0, $pos); }
+                my str $after = "";
+                if ($pos < length($input)) { $after = substr($input, $pos); }
+                $input = $before . $key . $after;
+                $pos = $pos + 1;
+                # Auto-show completions when typing after /
+                if ($key eq "/") {
+                    $show_completions = 1;
+                    $comp_scroll = 0;
+                }
+            }
+        }
+    }
+    return "";
+}
+
+func cmd_find_file() void {
+    my str $path = mb_read_file("Find file: ");
+    if (length($path) == 0) { return; }
+    # Strip trailing / if it's a file, not a dir
+    if (length($path) > 1 && substr($path, length($path) - 1, 1) eq "/" && is_directory($path) != 1) {
+        $path = substr($path, 0, length($path) - 1);
+    }
+
+    # Check if already open in a buffer
+    my int $i = 0;
+    while ($i < buf_count()) {
+        my scalar $b = $BUFFERS->[$i];
+        if ($b->{"filename"} eq $path) {
+            buf_save_state();
+            win_save_state();
+            buf_load_state($i);
+            my scalar $cw = $WINDOWS->[$WIN_IDX];
+            $cw->{"buf_idx"} = $BUF_IDX;
+            set_msg("Switched to: " . $BNAME);
+            return;
+        }
+        $i = $i + 1;
+    }
+
+    # Create new buffer and open file
+    buf_save_state();
+    win_save_state();
+    buf_new("new", $path);
+    buf_load_state(buf_count() - 1);
+    file_open($path);
+    my scalar $cw = $WINDOWS->[$WIN_IDX];
+    $cw->{"buf_idx"} = $BUF_IDX;
+}
+
+func cmd_switch_buffer() void {
+    my str $name = mb_read_with_complete("Switch to buffer: ", "buffer");
+    if (length($name) == 0) { return; }
+    my int $idx = buf_find($name);
+    if ($idx == -1) {
+        # Create new buffer with this name
+        buf_save_state();
+        win_save_state();
+        buf_new($name, "");
+        buf_load_state(buf_count() - 1);
+        my scalar $cw = $WINDOWS->[$WIN_IDX];
+        $cw->{"buf_idx"} = $BUF_IDX;
+        set_msg("New buffer: " . $name);
+    } else {
+        buf_save_state();
+        win_save_state();
+        buf_load_state($idx);
+        my scalar $cw = $WINDOWS->[$WIN_IDX];
+        $cw->{"buf_idx"} = $BUF_IDX;
+        set_msg("Buffer: " . $name);
+    }
+}
+
+func cmd_kill_buffer() void {
+    if (buf_count() <= 1) {
+        set_msg("Cannot kill last buffer.");
+        return;
+    }
+    if ($DIRTY == 1) {
+        my int $yn = mb_read_yn("Buffer modified; kill anyway?");
+        if ($yn != 1) {
+            set_msg("Not killed.");
+            return;
+        }
+    }
+    my str $killed = $BNAME;
+    splice(@$BUFFERS, $BUF_IDX, 1);
+    if ($BUF_IDX >= buf_count()) {
+        $BUF_IDX = buf_count() - 1;
+    }
+    buf_load_state($BUF_IDX);
+    set_msg("Killed buffer: " . $killed);
+}
+
+func cmd_list_buffers() void {
+    my str $list = "Buffers: ";
+    my int $i = 0;
+    while ($i < buf_count()) {
+        my scalar $b = $BUFFERS->[$i];
+        if ($i > 0) { $list = $list . " | "; }
+        if ($i == $BUF_IDX) {
+            $list = $list . "[" . $b->{"name"} . "]";
+        } else {
+            $list = $list . $b->{"name"};
+        }
+        $i = $i + 1;
+    }
+    set_msg($list);
+}
+
+# ===========================================================================
+# Key Dispatch
+# ===========================================================================
+
+func handle_cx(str $key) void {
+    if ($key eq "C-s") {
+        file_save();
+    } elsif ($key eq "C-f") {
+        cmd_find_file();
+    } elsif ($key eq "C-c") {
+        if ($DIRTY == 1) {
+            my int $yn = mb_read_yn("Modified buffers exist; exit anyway?");
+            if ($yn != 1) {
+                set_msg("Cancelled.");
+                return;
+            }
+        }
+        $RUNNING = 0;
+    } elsif ($key eq "b") {
+        cmd_switch_buffer();
+    } elsif ($key eq "k") {
+        cmd_kill_buffer();
+    } elsif ($key eq "o") {
+        win_other();
+    } elsif ($key eq "C-b") {
+        cmd_list_buffers();
+    } elsif ($key eq "2") {
+        win_split();
+    } elsif ($key eq "3") {
+        win_split_vertical();
+    } elsif ($key eq "1") {
+        win_delete_others();
+    } elsif ($key eq "h") {
+        # Select all (mark whole buffer)
+        move_buf_start();
+        edit_set_mark();
+        move_buf_end();
+        set_msg("Buffer selected.");
+    } else {
+        set_msg("C-x " . $key . " is undefined.");
+    }
+}
+
+func describe_key(str $dk) void {
+    if ($dk eq "C-f") { set_msg("C-f: move-forward"); return; }
+    if ($dk eq "C-b") { set_msg("C-b: move-backward"); return; }
+    if ($dk eq "C-n") { set_msg("C-n: move-down"); return; }
+    if ($dk eq "C-p") { set_msg("C-p: move-up"); return; }
+    if ($dk eq "C-a") { set_msg("C-a: move-beginning-of-line"); return; }
+    if ($dk eq "C-e") { set_msg("C-e: move-end-of-line"); return; }
+    if ($dk eq "C-v") { set_msg("C-v: page-down"); return; }
+    if ($dk eq "C-d") { set_msg("C-d: delete-char"); return; }
+    if ($dk eq "C-k") { set_msg("C-k: kill-line"); return; }
+    if ($dk eq "C-y") { set_msg("C-y: yank"); return; }
+    if ($dk eq "C-w") { set_msg("C-w: kill-region"); return; }
+    if ($dk eq "C-s") { set_msg("C-s: isearch-forward"); return; }
+    if ($dk eq "C-r") { set_msg("C-r: isearch-backward"); return; }
+    if ($dk eq "C-g") { set_msg("C-g: keyboard-quit"); return; }
+    if ($dk eq "C-l") { set_msg("C-l: recenter"); return; }
+    if ($dk eq "C-o") { set_msg("C-o: other-window (split) / open-line (single)"); return; }
+    if ($dk eq "C-_") { set_msg("C-_: undo"); return; }
+    if ($dk eq "C- ") { set_msg("C-SPC: set-mark"); return; }
+    if ($dk eq "C-x") { set_msg("C-x: prefix key (C-c=quit, C-s=save, C-f=find-file, b=switch-buffer, k=kill-buffer, 2/3=split)"); return; }
+    if ($dk eq "C-h") { set_msg("C-h: help prefix (b=bindings, k=describe-key)"); return; }
+    if ($dk eq "M-v") { set_msg("M-v: page-up"); return; }
+    if ($dk eq "M-f") { set_msg("M-f: forward-word"); return; }
+    if ($dk eq "M-b") { set_msg("M-b: backward-word"); return; }
+    if ($dk eq "M-<") { set_msg("M-<: beginning-of-buffer"); return; }
+    if ($dk eq "M->") { set_msg("M->: end-of-buffer"); return; }
+    if ($dk eq "M-w") { set_msg("M-w: copy-region"); return; }
+    if ($dk eq "M-d") { set_msg("M-d: kill-word"); return; }
+    if ($dk eq "M-q") { set_msg("M-q: fill-paragraph"); return; }
+    if ($dk eq "M-x") { set_msg("M-x: execute-command"); return; }
+    if ($dk eq "M-%") { set_msg("M-%: query-replace"); return; }
+    if ($dk eq "M-g") { set_msg("M-g: goto-line"); return; }
+    if ($dk eq "M-BACKSPACE") { set_msg("M-Backspace: backward-kill-word"); return; }
+    if ($dk eq "BACKSPACE") { set_msg("Backspace: backward-delete-char"); return; }
+    if ($dk eq "RET") { set_msg("RET: newline"); return; }
+    if ($dk eq "TAB") { set_msg("TAB: indent"); return; }
+    if ($dk eq "DEL") { set_msg("DEL: delete-char"); return; }
+    set_msg($dk . " is not bound");
+}
+
+func show_help_bindings() void {
+    # Create a *Help* buffer with keybinding reference
+    my int $hi = -1;
+    my int $bi = 0;
+    while ($bi < scalar(@$BUFFERS)) {
+        my scalar $b = $BUFFERS->[$bi];
+        if ($b->{"name"} eq "*Help*") {
+            $hi = $bi;
+            last;
+        }
+        $bi = $bi + 1;
+    }
+    if ($hi < 0) {
+        # Create new help buffer
+        my scalar $hbuf = {};
+        $hbuf->{"name"} = "*Help*";
+        $hbuf->{"filename"} = "";
+        $hbuf->{"path"} = "";
+        $hbuf->{"lines"} = [];
+        $hbuf->{"dirty"} = 0;
+        $hbuf->{"cx"} = 0;
+        $hbuf->{"cy"} = 0;
+        $hbuf->{"sx"} = 0;
+        $hbuf->{"sy"} = 0;
+        $hbuf->{"syntax"} = "";
+        $hbuf->{"mode"} = "Help";
+        $hbuf->{"undo"} = [];
+        $hbuf->{"undo_pos"} = -1;
+        push(@$BUFFERS, $hbuf);
+        $hi = scalar(@$BUFFERS) - 1;
+    }
+
+    my scalar $lines = [];
+    push(@$lines, "smacs Key Bindings");
+    push(@$lines, "==================");
+    push(@$lines, "");
+    push(@$lines, "Movement:");
+    push(@$lines, "  C-f / RIGHT     Forward char");
+    push(@$lines, "  C-b / LEFT      Backward char");
+    push(@$lines, "  C-n / DOWN      Next line");
+    push(@$lines, "  C-p / UP        Previous line");
+    push(@$lines, "  C-a / HOME      Beginning of line");
+    push(@$lines, "  C-e / END       End of line");
+    push(@$lines, "  M-f             Forward word");
+    push(@$lines, "  M-b             Backward word");
+    push(@$lines, "  C-v / PGDN      Page down");
+    push(@$lines, "  M-v / PGUP      Page up");
+    push(@$lines, "  M-<             Beginning of buffer");
+    push(@$lines, "  M->             End of buffer");
+    push(@$lines, "  M-g             Goto line");
+    push(@$lines, "");
+    push(@$lines, "Editing:");
+    push(@$lines, "  C-d / DEL       Delete char");
+    push(@$lines, "  Backspace       Backward delete char");
+    push(@$lines, "  C-k             Kill line");
+    push(@$lines, "  C-y             Yank (paste)");
+    push(@$lines, "  C-w             Kill region");
+    push(@$lines, "  M-w             Copy region");
+    push(@$lines, "  C-SPC           Set mark");
+    push(@$lines, "  M-d             Kill word forward");
+    push(@$lines, "  M-q             Fill paragraph");
+    push(@$lines, "  M-Backspace     Kill word backward");
+    push(@$lines, "  C-_  / C-/      Undo");
+    push(@$lines, "  C-o             Other window / Open line");
+    push(@$lines, "  TAB             Indent / insert tab");
+    push(@$lines, "");
+    push(@$lines, "Search & Replace:");
+    push(@$lines, "  C-s             Incremental search forward");
+    push(@$lines, "  C-r             Incremental search backward");
+    push(@$lines, "  M-%             Query replace");
+    push(@$lines, "");
+    push(@$lines, "Files & Buffers:");
+    push(@$lines, "  C-x C-s        Save file");
+    push(@$lines, "  C-x C-f        Find (open) file");
+    push(@$lines, "  C-x C-w        Write file (save as)");
+    push(@$lines, "  C-x b          Switch buffer");
+    push(@$lines, "  C-x k          Kill buffer");
+    push(@$lines, "  C-x RIGHT      Next buffer");
+    push(@$lines, "  C-x LEFT       Previous buffer");
+    push(@$lines, "  C-x C-c        Quit");
+    push(@$lines, "");
+    push(@$lines, "Window:");
+    push(@$lines, "  C-x 2          Split window horizontally");
+    push(@$lines, "  C-x 3          Split window vertically");
+    push(@$lines, "  C-x 1          Delete other windows");
+    push(@$lines, "  C-x o          Other window");
+    push(@$lines, "");
+    push(@$lines, "Help:");
+    push(@$lines, "  C-h b          Show this help");
+    push(@$lines, "  C-h k          Describe key");
+    push(@$lines, "");
+    push(@$lines, "Other:");
+    push(@$lines, "  M-x            Execute command");
+    push(@$lines, "  C-g            Cancel / keyboard quit");
+    push(@$lines, "  C-l            Redraw screen");
+    push(@$lines, "");
+    push(@$lines, "M-x Commands:");
+    push(@$lines, "  goto-line, replace-regexp, replace-string,");
+    push(@$lines, "  set-tab-width, tabify, untabify, indent-tabs-mode,");
+    push(@$lines, "  fill-paragraph, set-fill-column, count-words,");
+    push(@$lines, "  count-lines, revert-buffer, set-syntax,");
+    push(@$lines, "  load-vim-syntax, what-cursor-position,");
+    push(@$lines, "  line-numbers-mode, which-function-mode");
+
+    # Switch to help buffer
+    buf_save_state();
+    $BUFFERS->[$hi]->{"lines"} = $lines;
+    $BUFFERS->[$hi]->{"cy"} = 0;
+    $BUFFERS->[$hi]->{"cx"} = 0;
+    $BUFFERS->[$hi]->{"sy"} = 0;
+    $BUFFERS->[$hi]->{"sx"} = 0;
+    buf_load_state($hi);
+    set_msg("Type C-x k to close help, C-x b to switch back");
+}
+
+func handle_key(str $key) void {
+    if (length($key) == 0) { return; }
+
+    # Clear message on any key
+    $MSG = "";
+
+    # ESC as pending Meta prefix (for slow ESC + key)
+    if ($key eq "ESC") {
+        set_msg("ESC-");
+        render();
+        my str $next = "";
+        while (length($next) == 0) {
+            $next = read_key();
+        }
+        if ($next eq "ESC" || $next eq "C-g") {
+            # ESC ESC or ESC C-g = cancel
+            $MSET = 0;
+            set_msg("Quit");
+            return;
+        }
+        # Convert to Meta key
+        if (length($next) == 1) {
+            handle_key("M-" . $next);
+        } else {
+            handle_key($next);
+        }
+        return;
+    }
+
+    # Ctrl keys
+    if ($key eq "C-x") {
+        set_msg("C-x-");
+        render();
+        my str $next = "";
+        while (length($next) == 0) {
+            $next = read_key();
+        }
+        handle_cx($next);
+        return;
+    }
+
+    if ($key eq "C-f") { move_forward(); return; }
+    if ($key eq "C-b") { move_backward(); return; }
+    if ($key eq "C-n") { move_down(); return; }
+    if ($key eq "C-p") { move_up(); return; }
+    if ($key eq "C-a") { move_bol(); return; }
+    if ($key eq "C-e") { move_eol(); return; }
+    if ($key eq "C-v") { move_page_down(); return; }
+    if ($key eq "C-d") { edit_delete(); return; }
+    if ($key eq "C-k") { edit_kill_line(); return; }
+    if ($key eq "C-y") { edit_yank(); return; }
+    if ($key eq "C-w") { edit_kill_region(); return; }
+    if ($key eq "C-s") { cmd_isearch(); return; }
+    if ($key eq "C-r") { cmd_isearch(); return; }
+    if ($key eq "C-g") { $MSET = 0; set_msg("Quit"); return; }
+    if ($key eq "C-l") { render(); return; }
+    if ($key eq "C-o") {
+        if ($WIN_COUNT > 1) { win_other(); } else { undo_save(); insert_line($CY + 1, ""); $DIRTY = 1; }
+        return;
+    }
+
+    # C-_ = undo (also C-/ on most terminals)
+    if ($key eq "C-_") { edit_undo(); return; }
+
+    # C-h = help prefix
+    if ($key eq "C-h") {
+        set_msg("C-h (b=bindings, k=describe-key, q=quit help)");
+        render();
+        my str $hk = "";
+        while (length($hk) == 0) {
+            $hk = read_key();
+        }
+        if ($hk eq "b") {
+            show_help_bindings();
+        } elsif ($hk eq "k") {
+            set_msg("Describe key: ");
+            render();
+            my str $dk = "";
+            while (length($dk) == 0) {
+                $dk = read_key();
+            }
+            describe_key($dk);
+        } elsif ($hk eq "C-h" || $hk eq "?") {
+            show_help_bindings();
+        } else {
+            set_msg("C-h " . $hk . " is undefined");
+        }
+        return;
+    }
+
+    # C-space = set mark
+    if ($key eq "C- ") { edit_set_mark(); return; }
+
+    # Alt/Meta keys
+    if ($key eq "M-v") { move_page_up(); return; }
+    if ($key eq "M-f") { move_forward_word(); return; }
+    if ($key eq "M-b") { move_backward_word(); return; }
+    if ($key eq "M-<") { move_buf_start(); return; }
+    if ($key eq "M->") { move_buf_end(); return; }
+    if ($key eq "M-w") { edit_copy_region(); return; }
+    if ($key eq "M-BACKSPACE") { edit_backward_kill_word(); return; }
+    if ($key eq "M-d") { edit_forward_kill_word(); return; }
+    if ($key eq "M-q") { fill_paragraph(); return; }
+    if ($key eq "M-x") { cmd_mx(); return; }
+    if ($key eq "M-%") { cmd_query_replace(); return; }
+    if ($key eq "M-g") {
+        # M-g g = goto-line
+        my str $linestr = mb_read("Goto line: ");
+        if (length($linestr) > 0) {
+            my int $target = core::atoi($linestr);
+            if ($target > 0) {
+                $CY = $target - 1;
+                $CX = 0;
+                clamp_cursor();
+            }
+        }
+        return;
+    }
+
+    # Arrow keys
+    if ($key eq "UP") { move_up(); return; }
+    if ($key eq "DOWN") { move_down(); return; }
+    if ($key eq "LEFT") { move_backward(); return; }
+    if ($key eq "RIGHT") { move_forward(); return; }
+    if ($key eq "HOME") { move_bol(); return; }
+    if ($key eq "END") { move_eol(); return; }
+    if ($key eq "PGUP") { move_page_up(); return; }
+    if ($key eq "PGDN") { move_page_down(); return; }
+    if ($key eq "DEL") { edit_delete(); return; }
+
+    # Special keys
+    if ($key eq "BACKSPACE") { edit_backspace(); return; }
+    if ($key eq "RET") { edit_newline(); return; }
+    if ($key eq "TAB") { edit_tab(); return; }
+
+    # Printable characters
+    if (length($key) == 1) {
+        my int $code = ord($key);
+        if ($code >= 32 && $code <= 126) {
+            edit_insert($key);
+            return;
+        }
+    }
+
+    # Unknown key
+    if (length($key) > 0) {
+        set_msg("Unbound key: " . $key);
+    }
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+func main() int {
+    $E = "\e";
+    $BUFFERS = [];
+    $BUF_IDX = 0;
+    $RUNNING = 1;
+    $MSG = "";
+    $KILL = "";
+    $MSET = 0;
+    $DIRTY = 0;
+    $FNAME = "";
+    $BNAME = "*scratch*";
+    $SYNTAX = "";
+    $SY = 0;
+    $SX = 0;
+    $CY = 0;
+    $CX = 0;
+    $MY = 0;
+    $MX = 0;
+
+    $UNDO = [];
+    $UNDO_MAX = 100;
+    $LINUM = 0;
+    $TAB_WIDTH = 4;
+    $INDENT_TABS = 0;
+    $MODE = "Text";
+    $HISTORY = {};
+    $HIST_MAX = 50;
+    $WHICH_FUNC = 1;
+    $FILL_COLUMN = 70;
+
+    syn_init();
+    load_config();
+
+    enable_raw();
+    update_size();
+
+    # Create initial buffer
+    buf_new("*scratch*", "");
+    $CL = $BUFFERS->[0]->{"lines"};
+
+    # Initialize window system
+    win_init();
+
+    # Open files from command line args
+    my array @args = core::argv();
+    my int $argc = scalar(@args);
+    if ($argc > 1) {
+        my int $i = 1;
+        while ($i < $argc) {
+            my str $path = $args[$i];
+            if ($path eq "--syntax" && $i + 1 < $argc) {
+                # --syntax file.vim
+                $i = $i + 1;
+                vim_syntax_load($args[$i]);
+            } else {
+                if ($i == 1) {
+                    # Replace scratch buffer with first file
+                    file_open($path);
+                } else {
+                    # Additional files in new buffers
+                    buf_save_state();
+                    buf_new("new", $path);
+                    buf_load_state(buf_count() - 1);
+                    file_open($path);
+                }
+            }
+            $i = $i + 1;
+        }
+    }
+
+    # Sync window with whatever buffer ended up active
+    my scalar $init_w = $WINDOWS->[$WIN_IDX];
+    $init_w->{"buf_idx"} = $BUF_IDX;
+
+    # Enter alternate screen
+    core::write_fd(1, $E . "[?1049h");
+
+    set_msg("smacs v0.1 - C-x C-c to quit, C-h for help, M-x for commands");
+
+    # Main loop
+    while ($RUNNING == 1) {
+        if (check_winch() == 1) {
+            update_size();
+        }
+        render();
+        my str $key = read_key();
+        if (length($key) > 0) {
+            handle_key($key);
+        }
+    }
+
+    # Leave alternate screen
+    core::write_fd(1, $E . "[?1049l");
+
+    disable_raw();
+    return 0;
+}
