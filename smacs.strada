@@ -57,6 +57,14 @@ our int $HIST_MAX;      # max entries per category
 our int $WHICH_FUNC;    # which-function-mode: 0=off, 1=on (default on)
 our int $FILL_COLUMN;   # fill-paragraph column width (default 70)
 our str $LAST_SEARCH;   # last isearch query
+our str $LAST_BUFFER;   # previously viewed buffer name
+
+our int $HEX_MODE;         # 1 when hex mode active
+our int $HEX_BYTE_POS;     # cursor byte offset into hex_data
+our int $HEX_IN_ASCII;     # 0 = hex column, 1 = ASCII column
+our int $HEX_NIBBLE;       # 0 = high nibble, 1 = low nibble
+our str $HEX_PREV_MODE;    # mode to restore on leave
+our str $HEX_PREV_SYNTAX;  # syntax to restore on leave
 
 our scalar $WINDOWS;    # array ref of window hashes
 our int $WIN_IDX;       # active window index
@@ -418,6 +426,10 @@ func buf_save_state() void {
     $buf->{"syntax"} = $SYNTAX;
     $buf->{"mode"} = $MODE;
     $buf->{"undo"} = $UNDO;
+    $buf->{"hex_mode"} = $HEX_MODE;
+    $buf->{"hex_byte_pos"} = $HEX_BYTE_POS;
+    $buf->{"hex_in_ascii"} = $HEX_IN_ASCII;
+    $buf->{"hex_nibble"} = $HEX_NIBBLE;
 }
 
 func buf_load_state(int $idx) void {
@@ -437,6 +449,14 @@ func buf_load_state(int $idx) void {
     if (!defined($UNDO)) {
         $UNDO = [];
     }
+    $HEX_MODE = $buf->{"hex_mode"};
+    if (!defined($HEX_MODE)) { $HEX_MODE = 0; }
+    $HEX_BYTE_POS = $buf->{"hex_byte_pos"};
+    if (!defined($HEX_BYTE_POS)) { $HEX_BYTE_POS = 0; }
+    $HEX_IN_ASCII = $buf->{"hex_in_ascii"};
+    if (!defined($HEX_IN_ASCII)) { $HEX_IN_ASCII = 0; }
+    $HEX_NIBBLE = $buf->{"hex_nibble"};
+    if (!defined($HEX_NIBBLE)) { $HEX_NIBBLE = 0; }
     if (length($MODE) == 0) {
         $MODE = "Text";
     }
@@ -813,12 +833,13 @@ func buf_switch(str $name) void {
         set_msg("No buffer named: " . $name);
         return;
     }
+    my str $prev = $BNAME;
     buf_save_state();
     win_save_state();
     buf_load_state($idx);
-    # Update the current window to track the new buffer
     my scalar $w = $WINDOWS->[$WIN_IDX];
     $w->{"buf_idx"} = $BUF_IDX;
+    $LAST_BUFFER = $prev;
 }
 
 func buf_names() str {
@@ -874,6 +895,30 @@ func set_msg(str $text) void {
 # File I/O
 # ===========================================================================
 
+func unique_dir_part(str $filepath, str $basename) str {
+    # Extract the parent directory name from a filepath for disambiguation
+    # e.g., "/home/user/src/main.c" with basename "main.c" -> "src"
+    my int $base_len = length($basename);
+    my int $path_len = length($filepath);
+    # Strip the basename and trailing slash
+    my int $dir_end = $path_len - $base_len - 1;
+    if ($dir_end < 0) { return ""; }
+    my str $dir_path = substr($filepath, 0, $dir_end);
+    # Find last component
+    my int $last_slash = -1;
+    my int $di = 0;
+    while ($di < length($dir_path)) {
+        if (substr($dir_path, $di, 1) eq "/") {
+            $last_slash = $di;
+        }
+        $di = $di + 1;
+    }
+    if ($last_slash >= 0 && $last_slash + 1 < length($dir_path)) {
+        return substr($dir_path, $last_slash + 1);
+    }
+    return $dir_path;
+}
+
 func file_open(str $path) void {
     my scalar $fh = core::open($path, "r");
     if (!defined($fh)) {
@@ -912,6 +957,26 @@ func file_open(str $path) void {
     if (substr($path, $slash, 1) eq "/") {
         $bname = substr($path, $slash + 1);
     }
+    # Uniquify buffer name: if another buffer has the same basename,
+    # append parent directory like Emacs: main.c<src> vs main.c<test>
+    my int $bi = 0;
+    while ($bi < scalar(@$BUFFERS)) {
+        if ($bi != $BUF_IDX) {
+            my scalar $other = $BUFFERS->[$bi];
+            if ($other->{"name"} eq $bname || substr($other->{"name"}, 0, length($bname)) eq $bname) {
+                # Conflict: disambiguate both buffers
+                my str $other_fname = $other->{"filename"};
+                if (length($other_fname) > 0) {
+                    my str $other_dir = unique_dir_part($other_fname, $bname);
+                    my str $new_other = $bname . "<" . $other_dir . ">";
+                    $other->{"name"} = $new_other;
+                }
+                my str $my_dir = unique_dir_part($path, $bname);
+                $bname = $bname . "<" . $my_dir . ">";
+            }
+        }
+        $bi = $bi + 1;
+    }
     $BNAME = $bname;
     $FNAME = $path;
     $SYNTAX = syn_detect($path);
@@ -925,6 +990,10 @@ func file_open(str $path) void {
 }
 
 func file_save() void {
+    if ($HEX_MODE == 1) {
+        hex_file_save();
+        return;
+    }
     if (length($FNAME) == 0) {
         my str $path = mb_read("Save as: ");
         if (length($path) == 0) {
@@ -2011,15 +2080,27 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
     } else {
         $left = $left . "--";
     }
-    $left = $left . " " . $bname;
+    # Show full path if available, otherwise buffer name
+    if ($is_active == 1 && length($FNAME) > 0) {
+        $left = $left . " " . $FNAME;
+    } else {
+        $left = $left . " " . $bname;
+    }
     if ($is_active == 1) {
         my str $wf = which_function();
         if (length($wf) > 0) {
             $left = $left . "  " . $wf . "()";
         }
     }
-    my int $display_col = u8_byte_to_col(get_line($cy), $cx) + 1;
-    my str $right = " L" . ($cy + 1) . "/" . $lcount . " C" . $display_col . " ";
+    my str $right = "";
+    if ($mode eq "Hex" && $is_active == 1) {
+        my str $area = "hex";
+        if ($HEX_IN_ASCII == 1) { $area = "ascii"; }
+        $right = " 0x" . hex_offset_str($HEX_BYTE_POS) . " [" . $area . "] " . hex_data_len() . " bytes ";
+    } else {
+        my int $display_col = u8_byte_to_col(get_line($cy), $cx) + 1;
+        $right = " L" . ($cy + 1) . "/" . $lcount . " C" . $display_col . " ";
+    }
     $right = "(" . $mode . ") " . $right;
     my int $pad = $bar_width - length($left) - length($right);
     if ($pad < 0) { $pad = 0; }
@@ -2939,6 +3020,572 @@ func edit_undo() void {
 }
 
 # ===========================================================================
+# Hex Mode
+# ===========================================================================
+
+func hex_nibble_char(int $n) str {
+    if ($n == 0) { return "0"; }
+    if ($n == 1) { return "1"; }
+    if ($n == 2) { return "2"; }
+    if ($n == 3) { return "3"; }
+    if ($n == 4) { return "4"; }
+    if ($n == 5) { return "5"; }
+    if ($n == 6) { return "6"; }
+    if ($n == 7) { return "7"; }
+    if ($n == 8) { return "8"; }
+    if ($n == 9) { return "9"; }
+    if ($n == 10) { return "a"; }
+    if ($n == 11) { return "b"; }
+    if ($n == 12) { return "c"; }
+    if ($n == 13) { return "d"; }
+    if ($n == 14) { return "e"; }
+    if ($n == 15) { return "f"; }
+    return "0";
+}
+
+func hex_byte_str(int $b) str {
+    my int $hi = ($b - ($b % 16)) / 16;
+    my int $lo = $b % 16;
+    return hex_nibble_char($hi) . hex_nibble_char($lo);
+}
+
+func hex_offset_str(int $val) str {
+    # 8-digit hex offset
+    my str $out = "";
+    my int $i = 0;
+    while ($i < 8) {
+        my int $nibble = $val % 16;
+        $out = hex_nibble_char($nibble) . $out;
+        $val = ($val - $nibble) / 16;
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+func hex_format_line(str $data, int $offset, int $total) str {
+    my str $line = hex_offset_str($offset) . "  ";
+    my str $ascii = "|";
+    my int $i = 0;
+    while ($i < 16) {
+        my int $pos = $offset + $i;
+        if ($i == 8) {
+            $line = $line . " ";
+        }
+        if ($pos < $total) {
+            my int $b = core::get_byte($data, $pos);
+            $line = $line . hex_byte_str($b) . " ";
+            if ($b >= 32 && $b <= 126) {
+                $ascii = $ascii . chr($b);
+            } else {
+                $ascii = $ascii . ".";
+            }
+        } else {
+            $line = $line . "   ";
+            $ascii = $ascii . " ";
+        }
+        $i = $i + 1;
+    }
+    $ascii = $ascii . "|";
+    return $line . " " . $ascii;
+}
+
+func hex_rebuild_lines() void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data)) { $data = ""; }
+    my int $total = core::byte_length($data);
+    my scalar $lines = [];
+    my int $off = 0;
+    while ($off < $total) {
+        push(@$lines, hex_format_line($data, $off, $total));
+        $off = $off + 16;
+    }
+    if (scalar(@$lines) == 0) {
+        push(@$lines, hex_format_line("", 0, 0));
+    }
+    $buf->{"lines"} = $lines;
+    $CL = $lines;
+}
+
+func hex_data_len() int {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data)) { return 0; }
+    return core::byte_length($data);
+}
+
+func hex_pos_to_cursor() void {
+    my int $total = hex_data_len();
+    if ($HEX_BYTE_POS < 0) { $HEX_BYTE_POS = 0; }
+    if ($total > 0 && $HEX_BYTE_POS >= $total) { $HEX_BYTE_POS = $total - 1; }
+    if ($total == 0) { $HEX_BYTE_POS = 0; }
+    my int $row = ($HEX_BYTE_POS - ($HEX_BYTE_POS % 16)) / 16;
+    my int $col_in_row = $HEX_BYTE_POS % 16;
+    $CY = $row;
+    if ($HEX_IN_ASCII == 1) {
+        # ASCII area: offset(8) + 2 + hex_area(49) + 1 + pipe(1) = 61, then col_in_row
+        $CX = 61 + col_in_row;
+    } else {
+        # Hex area: offset(8) + 2 = 10, each byte is 3 chars, extra space after byte 7
+        my int $extra = 0;
+        if ($col_in_row >= 8) { $extra = 1; }
+        $CX = 10 + $col_in_row * 3 + $extra + $HEX_NIBBLE;
+    }
+}
+
+func hex_enter_mode() void {
+    if ($HEX_MODE == 1) { return; }
+    $HEX_PREV_MODE = $MODE;
+    $HEX_PREV_SYNTAX = $SYNTAX;
+
+    # Build raw data from buffer lines
+    my str $data = "";
+    my int $i = 0;
+    my int $n = line_count();
+    # If file is open, re-read as binary; otherwise join lines
+    if (length($FNAME) > 0) {
+        $data = core::slurp($FNAME);
+    } else {
+        while ($i < $n) {
+            if ($i > 0) {
+                $data = $data . "\n";
+            }
+            $data = $data . get_line($i);
+            $i = $i + 1;
+        }
+    }
+
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"hex_data"} = $data;
+
+    $HEX_MODE = 1;
+    $HEX_BYTE_POS = 0;
+    $HEX_IN_ASCII = 0;
+    $HEX_NIBBLE = 0;
+    $MODE = "Hex";
+    $SYNTAX = "";
+    $SX = 0;
+    $SY = 0;
+
+    hex_rebuild_lines();
+    hex_pos_to_cursor();
+    set_msg("Hex mode. TAB toggles hex/ascii. M-x hex-mode to leave.");
+}
+
+func hex_leave_mode() void {
+    if ($HEX_MODE == 0) { return; }
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data)) { $data = ""; }
+
+    # Convert binary data back to text lines (split on newlines)
+    my scalar $lines = [];
+    my str $cur = "";
+    my int $i = 0;
+    my int $total = core::byte_length($data);
+    while ($i < $total) {
+        my int $b = core::get_byte($data, $i);
+        if ($b == 10) {
+            push(@$lines, $cur);
+            $cur = "";
+        } else {
+            $cur = $cur . chr($b);
+        }
+        $i = $i + 1;
+    }
+    push(@$lines, $cur);
+
+    $buf->{"lines"} = $lines;
+    $buf->{"hex_data"} = undef;
+    $CL = $lines;
+
+    $HEX_MODE = 0;
+    $MODE = $HEX_PREV_MODE;
+    $SYNTAX = $HEX_PREV_SYNTAX;
+    if (length($MODE) == 0) { $MODE = "Text"; }
+    $CY = 0;
+    $CX = 0;
+    $SY = 0;
+    $SX = 0;
+    set_msg("Left hex mode.");
+}
+
+func hex_set_byte(int $pos, int $byte_val) void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data)) { return; }
+    my int $total = core::byte_length($data);
+    if ($pos < 0 || $pos >= $total) { return; }
+    my str $before = "";
+    if ($pos > 0) {
+        $before = substr($data, 0, $pos);
+    }
+    my str $after = "";
+    if ($pos + 1 < $total) {
+        $after = substr($data, $pos + 1);
+    }
+    $buf->{"hex_data"} = $before . chr($byte_val) . $after;
+}
+
+func hex_char_to_nibble(str $ch) int {
+    if ($ch eq "0") { return 0; }
+    if ($ch eq "1") { return 1; }
+    if ($ch eq "2") { return 2; }
+    if ($ch eq "3") { return 3; }
+    if ($ch eq "4") { return 4; }
+    if ($ch eq "5") { return 5; }
+    if ($ch eq "6") { return 6; }
+    if ($ch eq "7") { return 7; }
+    if ($ch eq "8") { return 8; }
+    if ($ch eq "9") { return 9; }
+    if ($ch eq "a" || $ch eq "A") { return 10; }
+    if ($ch eq "b" || $ch eq "B") { return 11; }
+    if ($ch eq "c" || $ch eq "C") { return 12; }
+    if ($ch eq "d" || $ch eq "D") { return 13; }
+    if ($ch eq "e" || $ch eq "E") { return 14; }
+    if ($ch eq "f" || $ch eq "F") { return 15; }
+    return -1;
+}
+
+func hex_is_hex_char(str $ch) int {
+    if (hex_char_to_nibble($ch) >= 0) { return 1; }
+    return 0;
+}
+
+func hex_undo_save() void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my scalar $snap = {};
+    $snap->{"cy"} = $CY;
+    $snap->{"cx"} = $CX;
+    $snap->{"hex_data"} = $buf->{"hex_data"};
+    $snap->{"hex_byte_pos"} = $HEX_BYTE_POS;
+    push(@$UNDO, $snap);
+    while (scalar(@$UNDO) > $UNDO_MAX) {
+        shift(@$UNDO);
+    }
+}
+
+func hex_undo_restore() void {
+    if (scalar(@$UNDO) == 0) {
+        set_msg("No further undo information.");
+        return;
+    }
+    my scalar $snap = pop(@$UNDO);
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"hex_data"} = $snap->{"hex_data"};
+    $HEX_BYTE_POS = $snap->{"hex_byte_pos"};
+    hex_rebuild_lines();
+    hex_pos_to_cursor();
+    $DIRTY = 1;
+    set_msg("Undo.");
+}
+
+func hex_edit_hex(str $ch) void {
+    my int $nib = hex_char_to_nibble($ch);
+    if ($nib < 0) { return; }
+    my int $total = hex_data_len();
+    if ($total == 0) { return; }
+    hex_undo_save();
+
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    my int $cur_byte = core::get_byte($data, $HEX_BYTE_POS);
+    my int $new_byte = 0;
+    if ($HEX_NIBBLE == 0) {
+        # Replace high nibble
+        $new_byte = $nib * 16 + ($cur_byte % 16);
+        hex_set_byte($HEX_BYTE_POS, $new_byte);
+        $HEX_NIBBLE = 1;
+    } else {
+        # Replace low nibble
+        $new_byte = ($cur_byte - ($cur_byte % 16)) + $nib;
+        hex_set_byte($HEX_BYTE_POS, $new_byte);
+        $HEX_NIBBLE = 0;
+        # Advance to next byte
+        if ($HEX_BYTE_POS < $total - 1) {
+            $HEX_BYTE_POS = $HEX_BYTE_POS + 1;
+        }
+    }
+    hex_rebuild_lines();
+    hex_pos_to_cursor();
+    $DIRTY = 1;
+}
+
+func hex_edit_ascii(str $ch) void {
+    my int $total = hex_data_len();
+    if ($total == 0) { return; }
+    hex_undo_save();
+    my int $byte_val = ord($ch);
+    hex_set_byte($HEX_BYTE_POS, $byte_val);
+    if ($HEX_BYTE_POS < $total - 1) {
+        $HEX_BYTE_POS = $HEX_BYTE_POS + 1;
+    }
+    hex_rebuild_lines();
+    hex_pos_to_cursor();
+    $DIRTY = 1;
+}
+
+func hex_move_up() void {
+    if ($HEX_BYTE_POS >= 16) {
+        $HEX_BYTE_POS = $HEX_BYTE_POS - 16;
+    }
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_move_down() void {
+    my int $total = hex_data_len();
+    if ($HEX_BYTE_POS + 16 < $total) {
+        $HEX_BYTE_POS = $HEX_BYTE_POS + 16;
+    }
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_move_left() void {
+    if ($HEX_IN_ASCII == 0) {
+        if ($HEX_NIBBLE == 1) {
+            $HEX_NIBBLE = 0;
+        } elsif ($HEX_BYTE_POS > 0) {
+            $HEX_BYTE_POS = $HEX_BYTE_POS - 1;
+            $HEX_NIBBLE = 1;
+        }
+    } else {
+        if ($HEX_BYTE_POS > 0) {
+            $HEX_BYTE_POS = $HEX_BYTE_POS - 1;
+        }
+    }
+    hex_pos_to_cursor();
+}
+
+func hex_move_right() void {
+    my int $total = hex_data_len();
+    if ($HEX_IN_ASCII == 0) {
+        if ($HEX_NIBBLE == 0) {
+            $HEX_NIBBLE = 1;
+        } elsif ($HEX_BYTE_POS < $total - 1) {
+            $HEX_BYTE_POS = $HEX_BYTE_POS + 1;
+            $HEX_NIBBLE = 0;
+        }
+    } else {
+        if ($HEX_BYTE_POS < $total - 1) {
+            $HEX_BYTE_POS = $HEX_BYTE_POS + 1;
+        }
+    }
+    hex_pos_to_cursor();
+}
+
+func hex_move_bol() void {
+    $HEX_BYTE_POS = $HEX_BYTE_POS - ($HEX_BYTE_POS % 16);
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_move_eol() void {
+    my int $total = hex_data_len();
+    my int $row_start = $HEX_BYTE_POS - ($HEX_BYTE_POS % 16);
+    my int $row_end = $row_start + 15;
+    if ($row_end >= $total) { $row_end = $total - 1; }
+    $HEX_BYTE_POS = $row_end;
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_page_down() void {
+    my int $total = hex_data_len();
+    my int $page = win_edit_rows() * 16;
+    $HEX_BYTE_POS = $HEX_BYTE_POS + $page;
+    if ($HEX_BYTE_POS >= $total) {
+        $HEX_BYTE_POS = $total - 1;
+        if ($HEX_BYTE_POS < 0) { $HEX_BYTE_POS = 0; }
+    }
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_page_up() void {
+    my int $page = win_edit_rows() * 16;
+    $HEX_BYTE_POS = $HEX_BYTE_POS - $page;
+    if ($HEX_BYTE_POS < 0) { $HEX_BYTE_POS = 0; }
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_toggle_area() void {
+    if ($HEX_IN_ASCII == 0) {
+        $HEX_IN_ASCII = 1;
+    } else {
+        $HEX_IN_ASCII = 0;
+    }
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+}
+
+func hex_file_save() void {
+    if (length($FNAME) == 0) {
+        my str $path = mb_read("Save as: ");
+        if (length($path) == 0) {
+            set_msg("Save cancelled.");
+            return;
+        }
+        $FNAME = $path;
+    }
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data)) { $data = ""; }
+    core::spew($FNAME, $data);
+    $DIRTY = 0;
+    my int $total = core::byte_length($data);
+    set_msg("Wrote " . $total . " bytes to " . $FNAME);
+}
+
+func hex_goto_offset() void {
+    my str $input = mb_read("Goto byte offset (hex): ");
+    if (length($input) == 0) { return; }
+    my int $val = 0;
+    my int $i = 0;
+    # Skip optional 0x prefix
+    if (length($input) > 2 && substr($input, 0, 2) eq "0x") {
+        $i = 2;
+    }
+    while ($i < length($input)) {
+        my str $ch = substr($input, $i, 1);
+        my int $nib = hex_char_to_nibble($ch);
+        if ($nib < 0) {
+            set_msg("Invalid hex offset.");
+            return;
+        }
+        $val = $val * 16 + $nib;
+        $i = $i + 1;
+    }
+    my int $total = hex_data_len();
+    if ($val >= $total) { $val = $total - 1; }
+    if ($val < 0) { $val = 0; }
+    $HEX_BYTE_POS = $val;
+    $HEX_NIBBLE = 0;
+    hex_pos_to_cursor();
+    set_msg("Offset: 0x" . hex_offset_str($val));
+}
+
+func hex_handle_key(str $key) void {
+    # ESC as Meta prefix
+    if ($key eq "ESC") {
+        set_msg("ESC-");
+        render();
+        my str $next = "";
+        while (length($next) == 0) {
+            $next = read_key();
+        }
+        if ($next eq "ESC" || $next eq "C-g") {
+            set_msg("Quit");
+            return;
+        }
+        if (length($next) == 1) {
+            hex_handle_key("M-" . $next);
+        } else {
+            hex_handle_key($next);
+        }
+        return;
+    }
+
+    # C-x prefix
+    if ($key eq "C-x") {
+        set_msg("C-x-");
+        render();
+        my str $next = "";
+        while (length($next) == 0) {
+            $next = read_key();
+        }
+        if ($next eq "C-s") {
+            hex_file_save();
+        } elsif ($next eq "C-c") {
+            if ($DIRTY == 1) {
+                my int $yn = mb_read_yn("Modified; exit anyway?");
+                if ($yn != 1) { set_msg("Cancelled."); return; }
+            }
+            $RUNNING = 0;
+        } elsif ($next eq "o") {
+            win_other();
+        } elsif ($next eq "2") {
+            win_split();
+        } elsif ($next eq "3") {
+            win_split_vertical();
+        } elsif ($next eq "1") {
+            win_delete_others();
+        } elsif ($next eq "C-w") {
+            # Save as
+            my str $path = mb_read("Write file: ");
+            if (length($path) > 0) {
+                $FNAME = $path;
+                hex_file_save();
+            }
+        } else {
+            set_msg("C-x " . $next . " is undefined in hex mode.");
+        }
+        return;
+    }
+
+    # Navigation
+    if ($key eq "C-f" || $key eq "RIGHT") { hex_move_right(); return; }
+    if ($key eq "C-b" || $key eq "LEFT") { hex_move_left(); return; }
+    if ($key eq "C-n" || $key eq "DOWN") { hex_move_down(); return; }
+    if ($key eq "C-p" || $key eq "UP") { hex_move_up(); return; }
+    if ($key eq "C-a" || $key eq "HOME") { hex_move_bol(); return; }
+    if ($key eq "C-e" || $key eq "END") { hex_move_eol(); return; }
+    if ($key eq "C-v" || $key eq "PGDN") { hex_page_down(); return; }
+    if ($key eq "M-v" || $key eq "PGUP") { hex_page_up(); return; }
+    if ($key eq "M-<") { $HEX_BYTE_POS = 0; $HEX_NIBBLE = 0; hex_pos_to_cursor(); return; }
+    if ($key eq "M->") {
+        my int $t = hex_data_len();
+        if ($t > 0) { $HEX_BYTE_POS = $t - 1; }
+        $HEX_NIBBLE = 0;
+        hex_pos_to_cursor();
+        return;
+    }
+
+    # Toggle hex/ascii
+    if ($key eq "TAB") { hex_toggle_area(); return; }
+
+    # Undo
+    if ($key eq "C-_") { hex_undo_restore(); return; }
+
+    # Cancel
+    if ($key eq "C-g") { set_msg("Quit"); return; }
+
+    # Redraw
+    if ($key eq "C-l") { render(); return; }
+
+    # M-x for commands (including leaving hex mode)
+    if ($key eq "M-x") { cmd_mx(); return; }
+
+    # M-g for goto offset
+    if ($key eq "M-g") { hex_goto_offset(); return; }
+
+    # C-o for other window
+    if ($key eq "C-o") {
+        if ($WIN_COUNT > 1) { win_other(); }
+        return;
+    }
+
+    # Editing: single printable characters
+    if (length($key) == 1) {
+        my int $code = ord($key);
+        if ($HEX_IN_ASCII == 0) {
+            # In hex area: only accept hex digits
+            if (hex_is_hex_char($key) == 1) {
+                hex_edit_hex($key);
+            }
+        } else {
+            # In ASCII area: accept printable characters
+            if ($code >= 32 && $code <= 126) {
+                hex_edit_ascii($key);
+            }
+        }
+        return;
+    }
+}
+
+# ===========================================================================
 # Directory Listing and Path Helpers
 # ===========================================================================
 
@@ -3072,7 +3719,7 @@ func complete_mx(str $input) array {
         "line-numbers-mode", "which-function-mode",
         "indent-tabs-mode", "set-tab-width",
         "tabify", "untabify", "count-words", "count-lines",
-        "fill-paragraph", "set-fill-column",
+        "fill-paragraph", "set-fill-column", "hex-mode",
         "text-mode", "strada-mode", "c-mode", "perl-mode",
         "python-mode", "javascript-mode", "html-mode", "css-mode",
         "shell-mode", "makefile-mode", "markdown-mode");
@@ -3877,6 +4524,14 @@ func cmd_mx() void {
         return;
     }
 
+    if ($cmd eq "hex-mode") {
+        if ($HEX_MODE == 1) {
+            hex_leave_mode();
+        } else {
+            hex_enter_mode();
+        }
+        return;
+    }
     if ($cmd eq "fill-paragraph") {
         fill_paragraph();
         return;
@@ -3949,8 +4604,22 @@ func cmd_mx() void {
 
 # Emacs-style file finder with completions panel
 func mb_read_file(str $prompt) str {
-    # Start with current directory
+    # Start with current file's directory, or cwd if no file
     my str $input = core::getcwd() . "/";
+    if (length($FNAME) > 0) {
+        # Find last slash in FNAME
+        my int $last_slash = -1;
+        my int $fi = 0;
+        while ($fi < length($FNAME)) {
+            if (substr($FNAME, $fi, 1) eq "/") {
+                $last_slash = $fi;
+            }
+            $fi = $fi + 1;
+        }
+        if ($last_slash >= 0) {
+            $input = substr($FNAME, 0, $last_slash + 1);
+        }
+    }
     my int $pos = length($input);
     my int $show_completions = 1;
     my int $comp_scroll = 0;
@@ -4256,8 +4925,19 @@ func cmd_find_file() void {
 }
 
 func cmd_switch_buffer() void {
-    my str $name = mb_read_with_complete("Switch to buffer: ", "buffer");
-    if (length($name) == 0) { return; }
+    my str $prompt = "Switch to buffer: ";
+    if (length($LAST_BUFFER) > 0) {
+        $prompt = "Switch to buffer (default " . $LAST_BUFFER . "): ";
+    }
+    my str $name = mb_read_with_complete($prompt, "buffer");
+    if (length($name) == 0) {
+        if (length($LAST_BUFFER) > 0) {
+            $name = $LAST_BUFFER;
+        } else {
+            return;
+        }
+    }
+    my str $prev = $BNAME;
     my int $idx = buf_find($name);
     if ($idx == -1) {
         # Create new buffer with this name
@@ -4276,6 +4956,7 @@ func cmd_switch_buffer() void {
         $cw->{"buf_idx"} = $BUF_IDX;
         set_msg("Buffer: " . $name);
     }
+    $LAST_BUFFER = $prev;
 }
 
 func cmd_kill_buffer() void {
@@ -4500,7 +5181,8 @@ func show_help_bindings() void {
     push(@$lines, "  fill-paragraph, set-fill-column, count-words,");
     push(@$lines, "  count-lines, revert-buffer, set-syntax,");
     push(@$lines, "  load-vim-syntax, what-cursor-position,");
-    push(@$lines, "  line-numbers-mode, which-function-mode");
+    push(@$lines, "  line-numbers-mode, which-function-mode,");
+    push(@$lines, "  hex-mode (toggle hex editor view)");
 
     # Switch to help buffer
     buf_save_state();
@@ -4518,6 +5200,12 @@ func handle_key(str $key) void {
 
     # Clear message on any key
     $MSG = "";
+
+    # Hex mode takes over all key handling
+    if ($HEX_MODE == 1) {
+        hex_handle_key($key);
+        return;
+    }
 
     # ESC as pending Meta prefix (for slow ESC + key)
     if ($key eq "ESC") {
@@ -4697,6 +5385,13 @@ func main() int {
     $WHICH_FUNC = 1;
     $FILL_COLUMN = 70;
     $LAST_SEARCH = "";
+    $LAST_BUFFER = "";
+    $HEX_MODE = 0;
+    $HEX_BYTE_POS = 0;
+    $HEX_IN_ASCII = 0;
+    $HEX_NIBBLE = 0;
+    $HEX_PREV_MODE = "";
+    $HEX_PREV_SYNTAX = "";
 
     syn_init();
     load_config();
