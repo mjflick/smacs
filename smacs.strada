@@ -4098,7 +4098,7 @@ func cmd_isearch() void {
         if (length($key) == 0) {
             next;
         }
-        if ($key eq "RET" || $key eq "ESC") {
+        if ($key eq "RET" || $key eq "ESC" || $key eq "UP" || $key eq "DOWN" || $key eq "C-n" || $key eq "C-p") {
             if (length($query) > 0) {
                 $LAST_SEARCH = $query;
             }
