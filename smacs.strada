@@ -1317,11 +1317,12 @@ func comp_scan_words(scalar $lines, str $prefix, scalar $seen, scalar $results) 
                         last;
                     }
                 }
-                my str $word = substr($line, $ws, $ci - $ws);
+                my str $word = "" . substr($line, $ws, $ci - $ws);
                 if (length($word) >= 3 && $word ne $prefix) {
                     if ($plen == 0 || substr($word, 0, $plen) eq $prefix) {
-                        if (!defined($seen->{$word}) || length("" . $seen->{$word}) == 0) {
-                            $seen->{$word} = "1";
+                        my str $wkey = "" . $word;
+                        if (!defined($seen->{$wkey}) || length("" . $seen->{$wkey}) == 0) {
+                            $seen->{$wkey} = "1";
                             push(@$results, $word);
                         }
                     }
@@ -1330,6 +1331,151 @@ func comp_scan_words(scalar $lines, str $prefix, scalar $seen, scalar $results) 
                 $ci = $ci + 1;
             }
         }
+        $li = $li + 1;
+    }
+}
+
+func comp_scan_decls(scalar $lines, str $prefix, scalar $seen, scalar $results) void {
+    my int $plen = length($prefix);
+    my int $li = 0;
+    my int $lc = scalar(@$lines);
+    if ($lc > 10000) { $lc = 10000; }
+    while ($li < $lc) {
+        my str $line = $lines->[$li];
+        my int $llen = length($line);
+
+        # Scan for variable declarations: my/our/local TYPE? $var / @var / %var
+        my int $ci = 0;
+        while ($ci < $llen) {
+            # Look for 'my ', 'our ', 'local '
+            my int $is_decl = 0;
+            if ($ci + 3 <= $llen && substr($line, $ci, 3) eq "my ") {
+                $ci = $ci + 3;
+                $is_decl = 1;
+            } elsif ($ci + 4 <= $llen && substr($line, $ci, 4) eq "our ") {
+                $ci = $ci + 4;
+                $is_decl = 1;
+            } elsif ($ci + 6 <= $llen && substr($line, $ci, 6) eq "local ") {
+                $ci = $ci + 6;
+                $is_decl = 1;
+            }
+            if ($is_decl == 1) {
+                # Skip optional type: int, str, scalar, array, hash, num, etc.
+                while ($ci < $llen && substr($line, $ci, 1) eq " ") { $ci = $ci + 1; }
+                if ($ci < $llen && is_word_char(substr($line, $ci, 1)) == 1) {
+                    my str $fc = substr($line, $ci, 1);
+                    if (!($fc eq "$" || $fc eq "@" || $fc eq "%" || $fc eq "(")) {
+                        # Skip the type word
+                        while ($ci < $llen && is_word_char(substr($line, $ci, 1)) == 1) { $ci = $ci + 1; }
+                        while ($ci < $llen && substr($line, $ci, 1) eq " ") { $ci = $ci + 1; }
+                    }
+                }
+                # Now expect sigil + name
+                if ($ci < $llen) {
+                    my str $sigil = substr($line, $ci, 1);
+                    if ($sigil eq "$" || $sigil eq "@" || $sigil eq "%") {
+                        my int $vs = $ci;
+                        $ci = $ci + 1;
+                        while ($ci < $llen && is_word_char(substr($line, $ci, 1)) == 1) { $ci = $ci + 1; }
+                        my str $var = "" . substr($line, $vs, $ci - $vs);
+                        if (length($var) >= 2 && $var ne $prefix) {
+                            if ($plen == 0 || substr($var, 0, $plen) eq $prefix) {
+                                my str $vkey = "" . $var;
+                                if (!defined($seen->{$vkey}) || length("" . $seen->{$vkey}) == 0) {
+                                    $seen->{$vkey} = "1";
+                                    push(@$results, $var);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                $ci = $ci + 1;
+            }
+        }
+
+        # Scan for function definitions: func/fn/sub NAME
+        my int $fi = 0;
+        while ($fi < $llen) {
+            my int $is_func = 0;
+            my int $kw_end = 0;
+            # Check for 'func ' or 'fn ' or 'sub '
+            if ($fi + 5 <= $llen && substr($line, $fi, 5) eq "func ") {
+                $is_func = 1;
+                $kw_end = $fi + 5;
+            } elsif ($fi + 3 <= $llen && substr($line, $fi, 3) eq "fn ") {
+                $is_func = 1;
+                $kw_end = $fi + 3;
+            } elsif ($fi + 4 <= $llen && substr($line, $fi, 4) eq "sub ") {
+                $is_func = 1;
+                $kw_end = $fi + 4;
+            }
+            if ($is_func == 1) {
+                # Must be at start of line or after whitespace/keywords
+                my int $ok = 0;
+                if ($fi == 0) { $ok = 1; }
+                elsif (substr($line, $fi - 1, 1) eq " " || substr($line, $fi - 1, 1) eq "\t") { $ok = 1; }
+                if ($ok == 1) {
+                    while ($kw_end < $llen && substr($line, $kw_end, 1) eq " ") { $kw_end = $kw_end + 1; }
+                    if ($kw_end < $llen && is_word_char(substr($line, $kw_end, 1)) == 1) {
+                        my int $ns = $kw_end;
+                        while ($kw_end < $llen && is_word_char(substr($line, $kw_end, 1)) == 1) { $kw_end = $kw_end + 1; }
+                        my str $fname = "" . substr($line, $ns, $kw_end - $ns);
+                        if (length($fname) >= 2 && $fname ne $prefix) {
+                            if ($plen == 0 || substr($fname, 0, $plen) eq $prefix) {
+                                my str $fkey = "" . $fname;
+                                if (!defined($seen->{$fkey}) || length("" . $seen->{$fkey}) == 0) {
+                                    $seen->{$fkey} = "1";
+                                    push(@$results, $fname);
+                                }
+                            }
+                        }
+                    }
+                }
+                $fi = $kw_end;
+            } else {
+                $fi = $fi + 1;
+            }
+        }
+
+        # Scan for C-style function definitions: type name( or type *name(
+        # Heuristic: line starts (after optional qualifiers) with word(s), then name(
+        my int $pi = 0;
+        # Skip leading whitespace
+        while ($pi < $llen && (substr($line, $pi, 1) eq " " || substr($line, $pi, 1) eq "\t")) { $pi = $pi + 1; }
+        # Skip preprocessor lines and comments
+        if ($pi < $llen && substr($line, $pi, 1) ne "#" && substr($line, $pi, 1) ne "/" && substr($line, $pi, 1) ne "*") {
+            # Collect words before a '(' — the last word before '(' is the function name
+            my int $paren = index($line, "(");
+            if ($paren > 0) {
+                # Walk backward from '(' to find function name
+                my int $pe = $paren;
+                # Skip * for pointer returns
+                while ($pe > $pi && substr($line, $pe - 1, 1) eq "*") { $pe = $pe - 1; }
+                # The function name is the word right before '('
+                my int $ne = $pe;
+                while ($ne > $pi && substr($line, $ne - 1, 1) eq " ") { $ne = $ne - 1; }
+                my int $ns = $ne;
+                while ($ns > $pi && is_word_char(substr($line, $ns - 1, 1)) == 1) { $ns = $ns - 1; }
+                if ($ns < $ne && $ns > $pi) {
+                    # There must be a return type before the name (at least one word before it)
+                    my str $fname = "" . substr($line, $ns, $ne - $ns);
+                    # Exclude control flow keywords
+                    if ($fname ne "if" && $fname ne "while" && $fname ne "for" && $fname ne "switch" && $fname ne "return" && $fname ne "sizeof" && $fname ne "else" && $fname ne "do" && $fname ne "case" && $fname ne "defined") {
+                        if (length($fname) >= 2 && $fname ne $prefix) {
+                            if ($plen == 0 || substr($fname, 0, $plen) eq $prefix) {
+                                my str $fkey = "" . $fname;
+                                if (!defined($seen->{$fkey}) || length("" . $seen->{$fkey}) == 0) {
+                                    $seen->{$fkey} = "1";
+                                    push(@$results, $fname);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         $li = $li + 1;
     }
 }
@@ -1380,15 +1526,19 @@ func comp_gather(str $prefix) scalar {
         }
     }
 
-    # 3. Current buffer words
+    # 3. Variables and function names from current buffer
+    comp_scan_decls($CL, $prefix, $seen, $results);
+
+    # 4. Current buffer words
     comp_scan_words($CL, $prefix, $seen, $results);
 
-    # 4. Other open buffers
+    # 5. Other open buffers (declarations then words)
     my int $bi = 0;
     while ($bi < scalar(@$BUFFERS)) {
         if ($bi != $BUF_IDX) {
             my scalar $buf = $BUFFERS->[$bi];
             my scalar $blines = $buf->{"lines"};
+            comp_scan_decls($blines, $prefix, $seen, $results);
             comp_scan_words($blines, $prefix, $seen, $results);
         }
         $bi = $bi + 1;
@@ -1436,30 +1586,19 @@ func comp_start() void {
         set_msg("No completions.");
         return;
     }
-    if ($n == 1) {
-        # Single match - insert immediately
-        my str $word = $COMP_LIST->[0];
-        if ($word eq $COMP_PREFIX) {
-            set_msg("Sole completion.");
-            return;
-        }
-        undo_save();
-        my str $line = get_line($CY);
-        my int $ps = $CX - length($COMP_PREFIX);
-        my str $before = substr($line, 0, $ps);
-        my str $after = "";
-        if ($CX < length($line)) { $after = substr($line, $CX); }
-        set_line($CY, $before . $word . $after);
-        $CX = $ps + length($word);
-        $DIRTY = 1;
-        set_msg("");
+    if ($n == 1 && $COMP_LIST->[0] eq $COMP_PREFIX) {
+        set_msg("Sole completion.");
         return;
     }
     $COMP_ACTIVE = 1;
     $COMP_IDX = 0;
     $COMP_SCROLL = 0;
     comp_anchor();
-    set_msg("Completions: " . $n);
+    if ($n == 1) {
+        set_msg("1 completion (TAB to accept)");
+    } else {
+        set_msg("Completions: " . $n);
+    }
 }
 
 func comp_accept() void {
@@ -6224,6 +6363,23 @@ func handle_key(str $key) void {
             comp_accept();
             return;
         }
+        if ($key eq "M-TAB") {
+            # Re-trigger: cycle through completions
+            if ($COMP_IDX < scalar(@$COMP_LIST) - 1) {
+                $COMP_IDX = $COMP_IDX + 1;
+            } else {
+                $COMP_IDX = 0;
+                $COMP_SCROLL = 0;
+            }
+            my int $max_vis = 8;
+            if ($COMP_IDX >= $COMP_SCROLL + $max_vis) {
+                $COMP_SCROLL = $COMP_IDX - $max_vis + 1;
+            }
+            if ($COMP_IDX < $COMP_SCROLL) {
+                $COMP_SCROLL = $COMP_IDX;
+            }
+            return;
+        }
         if ($key eq "C-g" || $key eq "ESC") {
             comp_dismiss();
             return;
@@ -6442,7 +6598,7 @@ func main() int {
     $COMP_SCROLL = 0;
     $COMP_DEFS = {};
     $COMP_DIR = "";
-    $COMP_MODE = 0;
+    $COMP_MODE = 1;
     $HEX_MODE = 0;
     $HEX_BYTE_POS = 0;
     $HEX_IN_ASCII = 0;
