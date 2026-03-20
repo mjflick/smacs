@@ -1,0 +1,111 @@
+# C language completion definitions for smacs
+
+# Keywords
+keyword: auto break case const continue default do else enum extern for goto
+keyword: if inline register restrict return sizeof static struct switch typedef
+keyword: union unsigned signed volatile while _Alignas _Alignof _Atomic
+keyword: _Bool _Complex _Generic _Imaginary _Noreturn _Static_assert _Thread_local
+
+# Types
+type: void int char short long float double size_t ssize_t ptrdiff_t
+type: int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+type: intptr_t uintptr_t intmax_t uintmax_t
+type: bool true false NULL
+type: FILE DIR
+type: pid_t uid_t gid_t off_t mode_t time_t clock_t
+type: fd_set socklen_t sa_family_t in_addr_t in_port_t
+type: pthread_t pthread_mutex_t pthread_cond_t pthread_attr_t
+
+# Preprocessor
+preprocessor: #include #define #undef #ifdef #ifndef #if #elif #else #endif
+preprocessor: #pragma #error #warning #line
+
+# Standard I/O (stdio.h)
+stdio: printf fprintf sprintf snprintf
+stdio: scanf fscanf sscanf
+stdio: puts fputs putchar fputc putc
+stdio: gets fgets getchar fgetc getc ungetc
+stdio: fopen fclose fflush freopen
+stdio: fread fwrite fseek ftell rewind feof ferror clearerr
+stdio: remove rename tmpfile tmpnam
+stdio: perror setbuf setvbuf
+
+# Standard library (stdlib.h)
+stdlib: malloc calloc realloc free
+stdlib: atoi atol atof strtol strtoul strtod strtoll strtoull
+stdlib: abs labs llabs div ldiv lldiv
+stdlib: rand srand
+stdlib: exit _exit atexit abort
+stdlib: getenv system
+stdlib: qsort bsearch
+
+# String (string.h)
+string: strlen strcmp strncmp strcpy strncpy strcat strncat
+string: strchr strrchr strstr strpbrk strspn strcspn strtok
+string: memcpy memmove memset memcmp memchr
+string: strerror strsignal
+string: strdup strndup
+
+# Memory / unistd
+unistd: read write open close lseek
+unistd: fork exec execv execve execvp
+unistd: pipe dup dup2
+unistd: getpid getppid getuid getgid geteuid getegid
+unistd: chdir getcwd chown fchown chroot
+unistd: link unlink symlink readlink rmdir mkdir
+unistd: access stat lstat fstat chmod fchmod
+unistd: sleep usleep alarm pause
+unistd: setsid getpgrp setpgid
+
+# Process / signal
+signal: signal sigaction kill raise
+signal: sigprocmask sigpending sigsuspend
+signal: SIGINT SIGTERM SIGKILL SIGHUP SIGPIPE SIGCHLD SIGUSR1 SIGUSR2
+signal: SIGALRM SIGSTOP SIGCONT SIGTSTP SIGSEGV SIGBUS SIGABRT
+
+# Socket
+socket: socket bind listen accept connect
+socket: send recv sendto recvfrom sendmsg recvmsg
+socket: shutdown close
+socket: setsockopt getsockopt getsockname getpeername
+socket: htons htonl ntohs ntohl
+socket: inet_aton inet_ntoa inet_pton inet_ntop
+socket: getaddrinfo freeaddrinfo gai_strerror
+socket: AF_INET AF_INET6 AF_UNIX SOCK_STREAM SOCK_DGRAM
+
+# pthread
+pthread: pthread_create pthread_join pthread_detach pthread_exit
+pthread: pthread_mutex_init pthread_mutex_lock pthread_mutex_unlock pthread_mutex_destroy
+pthread: pthread_cond_init pthread_cond_wait pthread_cond_signal pthread_cond_broadcast pthread_cond_destroy
+pthread: pthread_rwlock_init pthread_rwlock_rdlock pthread_rwlock_wrlock pthread_rwlock_unlock
+pthread: pthread_key_create pthread_setspecific pthread_getspecific
+pthread: pthread_self pthread_equal pthread_cancel
+
+# Math (math.h)
+math: sin cos tan asin acos atan atan2
+math: sinh cosh tanh
+math: exp log log10 log2
+math: pow sqrt cbrt hypot
+math: ceil floor round trunc fmod fabs
+math: isnan isinf isfinite
+math: M_PI M_E M_LN2 M_LN10 M_SQRT2
+
+# Time
+time: time difftime mktime
+time: localtime gmtime asctime ctime strftime
+time: clock gettimeofday clock_gettime
+time: nanosleep
+
+# Errno
+errno: errno EINTR EAGAIN EWOULDBLOCK EINVAL ENOMEM ENOENT EACCES EEXIST EPERM
+errno: EBADF ENOSPC EIO EPIPE ECONNREFUSED ECONNRESET ETIMEDOUT EADDRINUSE
+
+# Common macros
+macro: assert sizeof offsetof
+macro: MIN MAX BUFSIZ EOF FILENAME_MAX PATH_MAX
+macro: STDIN_FILENO STDOUT_FILENO STDERR_FILENO
+macro: stdin stdout stderr
+macro: O_RDONLY O_WRONLY O_RDWR O_CREAT O_TRUNC O_APPEND O_NONBLOCK
+macro: S_IRUSR S_IWUSR S_IXUSR S_IRGRP S_IWGRP S_IROTH
+macro: SEEK_SET SEEK_CUR SEEK_END
+macro: EXIT_SUCCESS EXIT_FAILURE

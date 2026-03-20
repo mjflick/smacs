@@ -39,6 +39,8 @@ is `key = value`, one per line. Lines starting with `#` are comments.
 | `vim-syntax` | path | - | Load a single vim syntax file |
 | `syntax-dir` | path | - | Load all vim syntax files from a directory |
 | `syntax-ext` | ext:lang | - | Map a file extension to a language |
+| `completion-mode` | `on`/`off` | `off` | Enable code completion (M-TAB) |
+| `complete-dir` | path | `~/.smacs/complete` | Directory of `.complete` autocomplete files |
 
 ### Example ~/.smacsrc
 
@@ -54,7 +56,59 @@ syntax-dir = ~/vim-syntax
 # Manual extension-to-language mappings
 syntax-ext = rs:rust
 syntax-ext = ts:typescript
+
+# Autocomplete definitions
+complete-dir = ~/.smacs/complete
 ```
+
+## Code Completion
+
+smacs provides prefix-based code completion triggered by `M-TAB` (Alt+Tab).
+Completion mode is off by default -- enable it with `M-x completion-mode`.
+
+Candidates come from three sources (in priority order):
+
+1. **Language definition files** -- `.complete` files in the `complete-dir`
+2. **Syntax keywords** -- from built-in highlighting and loaded vim syntax files
+3. **Buffer words** -- identifiers from all open buffers
+
+### Completion Definition Files
+
+Place files named `{language}.complete` in `~/.smacs/complete/` (or the
+directory set by `complete-dir`). Format:
+
+```
+# Comments start with #
+keyword: if else while for return func fn my our
+type: int str num scalar array hash void
+builtin: say print push pop shift unshift length substr
+core: core::open core::close core::read core::write
+method: new isa can
+```
+
+Each line has a category followed by a colon and space-separated words.
+Categories are for organization -- all words are merged into the candidate
+list. Multiple lines with the same category are combined.
+
+The language name is derived from the filename: `strada.complete` provides
+completions when editing `.strada` files, `c.complete` for `.c` files, etc.
+
+### Using Completion
+
+1. Type the beginning of a word
+2. Press `M-TAB` (or `ESC` then `TAB`)
+3. If one match: inserted immediately
+4. If multiple: a popup menu appears
+   - `C-n` / `DOWN` -- next candidate
+   - `C-p` / `UP` -- previous candidate
+   - `RET` / `TAB` -- accept selection
+   - `ESC` / `C-g` -- dismiss
+   - Continue typing to narrow the list
+
+Completion is context-aware: it handles `$variable` names, `core::` namespaced
+functions, and `->` method calls.
+
+Use `M-x reload-completions` to reload definition files after editing them.
 
 ## Syntax Highlighting
 

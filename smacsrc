@@ -1,0 +1,18 @@
+# smacs default configuration
+# Copy to ~/.smacsrc or /etc/smacsrc to customize
+
+# Display
+line-numbers = off
+tab-width = 4
+indent-tabs-mode = off
+fill-column = 70
+which-function-mode = on
+
+# Syntax highlighting (vim-style syntax files)
+# Installed to /usr/local/share/smacs/syntax by default
+syntax-dir = /usr/local/share/smacs/syntax
+
+# Code completion
+# Installed to /usr/local/share/smacs/complete by default
+complete-dir = /usr/local/share/smacs/complete
+completion-mode = off

@@ -1,0 +1,74 @@
+# Strada language completion definitions for smacs
+
+# Keywords
+keyword: func fn if elsif else unless while until for foreach return my our local
+keyword: last next redo do use package extends with has import_lib import_object import_archive
+keyword: try catch throw async await private const enum version
+keyword: BEGIN END before after around
+keyword: defined undef die exit
+
+# Attribute options
+keyword: ro rw required lazy builder
+
+# Types
+type: int num str scalar array hash void dynamic
+type: int8 int16 uint8 byte uint16 uint32 uint64 size_t char float double
+
+# Builtin functions
+builtin: say print push pop shift unshift splice length substr index rindex
+builtin: join split reverse sort map grep chomp chop
+builtin: chr ord sprintf printf keys values exists delete each
+builtin: ref tie untie tied select defined wantarray
+builtin: match replace replace_all lc uc lcfirst ucfirst trim
+builtin: scalar abs int hex oct
+builtin: undo_save
+
+# Core namespace functions
+core: core::open core::close core::read core::write core::seek core::tell
+core: core::eof core::flush core::rewind core::slurp core::spew
+core: core::open_str core::str_from_fh core::popen core::qx
+core: core::readline core::readdir
+core: core::getenv core::setenv core::getcwd core::chdir
+core: core::fork core::exec core::wait core::waitpid core::pipe
+core: core::kill core::getpid core::getppid core::alarm core::sleep
+core: core::signal core::_exit
+core: core::stat core::lstat core::chmod core::chown core::unlink core::rename
+core: core::mkdir core::rmdir core::symlink core::readlink core::realpath
+core: core::time core::localtime core::gmtime core::strftime core::mktime
+core: core::socket core::connect core::bind core::listen core::accept
+core: core::send core::recv core::setsockopt core::getsockname
+core: core::inet_aton core::inet_ntoa core::gethostbyname
+core: core::pack core::unpack core::base64_encode core::base64_decode
+core: core::hex_encode core::hex_decode
+core: core::ord_byte core::get_byte core::byte_length
+core: core::hash_keys core::hash_values core::hash_default_capacity core::array_reserve
+core: core::weaken core::isweak
+core: core::global_set core::global_get core::global_exists core::global_delete core::global_keys
+core: core::stack_trace core::set_recursion_limit core::wantarray core::wanthash
+core: core::term_enable_raw core::term_disable_raw core::term_rows core::term_cols
+core: core::atoi core::write_fd core::read_fd
+
+# Math namespace
+math: math::sin math::cos math::tan math::asin math::acos math::atan math::atan2
+math: math::sqrt math::pow math::log math::log10 math::exp
+math: math::abs math::ceil math::floor math::round
+math: math::rand math::srand math::pi
+
+# Async namespace
+async: async::all async::race async::timeout async::cancel
+async: async::channel async::send async::recv
+async: async::mutex async::lock async::unlock
+async: async::atomic async::atomic_add async::atomic_cas
+
+# UTF-8 namespace
+utf8: utf8::is_utf8 utf8::valid utf8::downgrade
+
+# SSL namespace
+ssl: ssl::connect ssl::read ssl::write ssl::close
+
+# C interop
+c: c::alloc c::free c::is_null c::sizeof
+
+# OOP methods
+method: new isa can AUTOLOAD DESTROY
+method: species name type value

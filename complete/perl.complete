@@ -1,0 +1,68 @@
+# Perl language completion definitions for smacs
+
+# Keywords
+keyword: sub my our local return if elsif else unless while until for foreach
+keyword: do use require package BEGIN END __END__ __DATA__
+keyword: last next redo goto die exit eval
+keyword: bless ref tie untie tied
+keyword: defined undef wantarray caller
+keyword: no strict warnings utf8 constant
+keyword: given when default
+
+# Types / Pragmas
+type: strict warnings utf8 Carp Exporter
+type: Scalar::Util List::Util File::Basename File::Path File::Spec
+type: Getopt::Long Data::Dumper Storable JSON POSIX
+
+# Moose / OOP
+keyword: extends with has before after around override augment
+keyword: is isa required default lazy builder clearer predicate
+keyword: ro rw
+
+# Builtin functions
+builtin: say print printf sprintf warn die exit
+builtin: push pop shift unshift splice
+builtin: length substr index rindex
+builtin: join split reverse sort map grep
+builtin: chomp chop lc uc lcfirst ucfirst
+builtin: chr ord hex oct abs int
+builtin: keys values exists delete each
+builtin: ref bless tie untie tied
+builtin: defined undef scalar wantarray caller
+builtin: open close read write seek tell eof flush
+builtin: binmode truncate fileno stat lstat
+builtin: opendir readdir closedir rewinddir
+builtin: rename unlink mkdir rmdir chdir chmod chown
+builtin: glob chroot link symlink readlink
+builtin: fork exec wait waitpid pipe kill alarm sleep
+builtin: getpid getppid getpgrp setpgrp
+builtin: socket connect bind listen accept shutdown
+builtin: send recv setsockopt getsockopt getsockname getpeername
+builtin: time localtime gmtime
+builtin: pack unpack vec
+builtin: eval do require use no
+builtin: pos quotemeta study
+builtin: chomp chop crypt
+builtin: system qx backtick
+
+# Common module functions
+module: Carp::croak Carp::carp Carp::confess Carp::cluck
+module: Scalar::Util::blessed Scalar::Util::reftype Scalar::Util::weaken Scalar::Util::looks_like_number
+module: List::Util::reduce List::Util::first List::Util::max List::Util::min List::Util::sum List::Util::any List::Util::all
+module: File::Basename::basename File::Basename::dirname File::Basename::fileparse
+module: File::Path::make_path File::Path::remove_tree
+module: File::Spec::catfile File::Spec::catdir File::Spec::rel2abs
+module: Getopt::Long::GetOptions
+module: Data::Dumper::Dumper
+module: JSON::encode_json JSON::decode_json
+module: Storable::freeze Storable::thaw Storable::store Storable::retrieve
+module: POSIX::strftime POSIX::floor POSIX::ceil POSIX::mktime
+
+# Special variables
+variable: $_ @_ $! $@ $/ $\ $, $; $" $0
+variable: $ARGV @ARGV %ENV @INC %INC @ISA
+variable: $^O $^W $^X
+
+# OOP methods
+method: new DESTROY AUTOLOAD import
+method: isa can DOES VERSION

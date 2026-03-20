@@ -46,6 +46,17 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 `which-function-mode` = `on` | `off`
 : Show current function name in the status bar. Default: `on`.
 
+## Code Completion Options
+
+`completion-mode` = `on` | `off`
+: Enable code completion via `M-TAB`. Default: `off`. Can also be
+  toggled at runtime with `M-x completion-mode`.
+
+`complete-dir` = *path*
+: Directory containing `.complete` definition files. Each file is named
+  `{language}.complete` and contains lines of `category: word1 word2 ...`.
+  Default: `~/.smacs/complete` (loaded automatically if it exists).
+
 ## Syntax Highlighting Options
 
 `syntax` = *language*
@@ -147,6 +158,11 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 `C-_`, `C-/`
 : Undo.
 
+`M-TAB`
+: Code completion (requires completion-mode to be enabled). Shows a popup
+  of matching candidates. Navigate with `C-n`/`C-p`, accept with
+  `RET`/`TAB`, dismiss with `ESC`/`C-g`.
+
 ## Search & Replace
 
 `C-s`
@@ -229,7 +245,8 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 `tabify`, `untabify`, `indent-tabs-mode`, `fill-paragraph`,
 `set-fill-column`, `count-words`, `count-lines`, `revert-buffer`,
 `set-syntax`, `load-vim-syntax`, `what-cursor-position`,
-`line-numbers-mode`, `which-function-mode`, `hex-mode`
+`line-numbers-mode`, `which-function-mode`, `hex-mode`,
+`completion-mode`, `reload-completions`
 
 # HEX MODE
 

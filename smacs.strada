@@ -86,6 +86,17 @@ our scalar $WINDOWS;    # array ref of window hashes
 our int $WIN_IDX;       # active window index
 our int $WIN_COUNT;     # number of windows
 
+our int $COMP_ACTIVE;       # 0=inactive, 1=popup visible
+our scalar $COMP_LIST;      # array ref of candidate strings
+our int $COMP_IDX;          # selected index in COMP_LIST
+our str $COMP_PREFIX;       # current prefix being completed
+our int $COMP_ROW;          # screen row for popup anchor (1-based)
+our int $COMP_COL;          # screen col for popup anchor (1-based)
+our int $COMP_SCROLL;       # scroll offset for long lists
+our scalar $COMP_DEFS;      # hash ref: lang -> hash ref: category -> space-separated words
+our str $COMP_DIR;          # path to completion definition files
+our int $COMP_MODE;         # 0=disabled, 1=enabled
+
 # ===========================================================================
 # Terminal Functions
 # ===========================================================================
@@ -169,6 +180,7 @@ func u8_prev(str $s, int $pos) int {
     # Skip continuation bytes (10xxxxxx = 0x80..0xBF)
     while ($pos > 0) {
         my int $b = core::get_byte($s, $pos);
+
         if ($b < 128 || $b >= 192) { return $pos; }
         $pos = $pos - 1;
     }
@@ -351,6 +363,10 @@ func read_key() str {
                 return "ESC";
             }
             return "ESC";
+        }
+        # Alt+Tab (ESC + TAB)
+        if ($c2 == 9) {
+            return "M-TAB";
         }
         # Alt+Backspace (ESC + DEL)
         if ($c2 == 127) {
@@ -1128,6 +1144,15 @@ func load_config_file(str $path) void {
                         my str $lang = substr($val, $cp + 1);
                         $SYN_EXT_MAP->{$ext} = $lang;
                     }
+                } elsif ($key eq "completion-mode") {
+                    if ($val eq "on" || $val eq "true" || $val eq "1") {
+                        $COMP_MODE = 1;
+                    } else {
+                        $COMP_MODE = 0;
+                    }
+                } elsif ($key eq "complete-dir") {
+                    $COMP_DIR = expand_tilde($val);
+                    comp_load_dir($COMP_DIR);
                 } elsif ($key eq "which-function-mode") {
                     if ($val eq "on" || $val eq "true" || $val eq "1") {
                         $WHICH_FUNC = 1;
@@ -1154,82 +1179,308 @@ func load_config() void {
 }
 
 # ===========================================================================
+# Code Completion
+# ===========================================================================
+
+func comp_load_file(str $path, str $lang) void {
+    my scalar $fh = core::open($path, "r");
+    if (!defined($fh)) { return; }
+    if (!defined($COMP_DEFS->{$lang})) {
+        $COMP_DEFS->{$lang} = {};
+    }
+    my scalar $def = $COMP_DEFS->{$lang};
+    my str $line = <$fh>;
+    while (defined($line)) {
+        if (length($line) > 0 && substr($line, 0, 1) ne "#") {
+            my int $colon = index($line, ":");
+            if ($colon > 0) {
+                my str $cat = trim(substr($line, 0, $colon));
+                my str $words = trim(substr($line, $colon + 1));
+                if (length($words) > 0) {
+                    if (defined($def->{$cat}) && length($def->{$cat}) > 0) {
+                        $def->{$cat} = $def->{$cat} . " " . $words;
+                    } else {
+                        $def->{$cat} = $words;
+                    }
+                }
+            }
+        }
+        $line = <$fh>;
+    }
+    core::close($fh);
+}
+
+func comp_load_dir(str $dir) void {
+    my array @entries = core::readdir($dir);
+    my int $count = 0;
+    my int $i = 0;
+    while ($i < scalar(@entries)) {
+        my str $name = $entries[$i];
+        my int $nlen = length($name);
+        if ($nlen > 9 && substr($name, $nlen - 9) eq ".complete") {
+            my str $lang = substr($name, 0, $nlen - 9);
+            comp_load_file($dir . "/" . $name, $lang);
+            $count = $count + 1;
+        }
+        $i = $i + 1;
+    }
+    if ($count > 0) {
+        set_msg("Loaded " . $count . " completion files from " . $dir);
+    }
+}
+
+func comp_is_word_ch(str $ch) int {
+    my int $code = ord($ch);
+    # a-z
+    if ($code >= 97 && $code <= 122) { return 1; }
+    # A-Z
+    if ($code >= 65 && $code <= 90) { return 1; }
+    # 0-9
+    if ($code >= 48 && $code <= 57) { return 1; }
+    # underscore
+    if ($code == 95) { return 1; }
+    return 0;
+}
+
+func comp_find_prefix() str {
+    my str $line = get_line($CY);
+    my int $end = $CX;
+    my int $start = $end;
+    while ($start > 0) {
+        my str $ch = substr($line, $start - 1, 1);
+        if (comp_is_word_ch($ch) == 1) {
+            $start = $start - 1;
+        } elsif ($ch eq ":" && $start >= 2 && substr($line, $start - 2, 1) eq ":") {
+            # Include :: for namespaced completions
+            $start = $start - 2;
+        } elsif ($ch eq "$" || $ch eq "@" || $ch eq "%") {
+            $start = $start - 1;
+            last;
+        } else {
+            last;
+        }
+    }
+    if ($start >= $end) { return ""; }
+    return substr($line, $start, $end - $start);
+}
+
+func comp_scan_words(scalar $lines, str $prefix, scalar $seen, scalar $results) void {
+    my int $plen = length($prefix);
+    my int $li = 0;
+    my int $line_count = scalar(@$lines);
+    if ($line_count > 5000) { $line_count = 5000; }
+    while ($li < $line_count) {
+        my str $line = $lines->[$li];
+        my int $llen = length($line);
+        my int $ci = 0;
+        while ($ci < $llen) {
+            my str $ch = substr($line, $ci, 1);
+            if (comp_is_word_ch($ch) == 1 || $ch eq "$" || $ch eq "@" || $ch eq "%") {
+                my int $ws = $ci;
+                $ci = $ci + 1;
+                while ($ci < $llen) {
+                    my str $wch = substr($line, $ci, 1);
+                    if (comp_is_word_ch($wch) == 1) {
+                        $ci = $ci + 1;
+                    } elsif ($wch eq ":" && $ci + 1 < $llen && substr($line, $ci + 1, 1) eq ":") {
+                        $ci = $ci + 2;
+                    } else {
+                        last;
+                    }
+                }
+                my str $word = substr($line, $ws, $ci - $ws);
+                if (length($word) >= 3 && $word ne $prefix) {
+                    if ($plen == 0 || substr($word, 0, $plen) eq $prefix) {
+                        if (!defined($seen->{$word}) || length("" . $seen->{$word}) == 0) {
+                            $seen->{$word} = "1";
+                            push(@$results, $word);
+                        }
+                    }
+                }
+            } else {
+                $ci = $ci + 1;
+            }
+        }
+        $li = $li + 1;
+    }
+}
+
+func comp_gather(str $prefix) scalar {
+    my scalar $seen = {};
+    my scalar $results = [];
+    my int $plen = length($prefix);
+
+    # 1. Language definition words first
+    if (length($SYNTAX) > 0 && defined($COMP_DEFS->{$SYNTAX})) {
+        my scalar $def = $COMP_DEFS->{$SYNTAX};
+        my array @cats = keys(%$def);
+        my int $ci = 0;
+        while ($ci < scalar(@cats)) {
+            my str $cat = $cats[$ci];
+            my str $words_str = $def->{$cat};
+            my array @words = split(" ", $words_str);
+            my int $wi = 0;
+            while ($wi < scalar(@words)) {
+                my str $w = $words[$wi];
+                if (length($w) > 0 && ($plen == 0 || substr($w, 0, $plen) eq $prefix)) {
+                    if (!defined($seen->{$w}) || length("" . $seen->{$w}) == 0) {
+                        $seen->{$w} = "1";
+                        push(@$results, $w);
+                    }
+                }
+                $wi = $wi + 1;
+            }
+            $ci = $ci + 1;
+        }
+    }
+
+    # 2. Syntax keywords (from syn_init / vim syntax)
+    if (defined($SYN_KEYWORDS) && defined($SYN_KEYWORDS->{$SYNTAX})) {
+        my scalar $kw_hash = $SYN_KEYWORDS->{$SYNTAX};
+        my array @kws = keys(%$kw_hash);
+        my int $ki = 0;
+        while ($ki < scalar(@kws)) {
+            my str $kw = $kws[$ki];
+            if (length($kw) >= 2 && ($plen == 0 || substr($kw, 0, $plen) eq $prefix)) {
+                if (!defined($seen->{$kw}) || length("" . $seen->{$kw}) == 0) {
+                    $seen->{$kw} = "1";
+                    push(@$results, $kw);
+                }
+            }
+            $ki = $ki + 1;
+        }
+    }
+
+    # 3. Current buffer words
+    comp_scan_words($CL, $prefix, $seen, $results);
+
+    # 4. Other open buffers
+    my int $bi = 0;
+    while ($bi < scalar(@$BUFFERS)) {
+        if ($bi != $BUF_IDX) {
+            my scalar $buf = $BUFFERS->[$bi];
+            my scalar $blines = $buf->{"lines"};
+            comp_scan_words($blines, $prefix, $seen, $results);
+        }
+        $bi = $bi + 1;
+    }
+
+    return $results;
+}
+
+func comp_anchor() void {
+    # Compute popup screen position from cursor
+    my scalar $win = $WINDOWS->[$WIN_IDX];
+    my int $win_top = $win->{"top_row"};
+    my int $win_left = $win->{"left_col"};
+    my str $cur_line = get_line($CY);
+    my int $cursor_col = u8_byte_to_col($cur_line, $CX);
+    my int $prefix_start_col = $cursor_col - length($COMP_PREFIX);
+    my int $gutter = 0;
+    if ($LINUM == 1) {
+        my int $total = scalar(@$CL);
+        my int $digs = 1;
+        while ($total >= 10) {
+            $total = ($total - ($total % 10)) / 10;
+            $digs = $digs + 1;
+        }
+        $gutter = $digs + 1;
+    }
+    $COMP_ROW = $CY - $SY + $win_top + 2;
+    $COMP_COL = $prefix_start_col - $SX + 1 + $gutter + $win_left;
+    if ($COMP_COL < 1) { $COMP_COL = 1; }
+}
+
+func comp_start() void {
+    if ($COMP_MODE == 0) {
+        set_msg("Completion mode is off. M-x completion-mode to enable.");
+        return;
+    }
+    $COMP_PREFIX = comp_find_prefix();
+    if (length($COMP_PREFIX) == 0) {
+        set_msg("No prefix at cursor.");
+        return;
+    }
+    $COMP_LIST = comp_gather($COMP_PREFIX);
+    my int $n = scalar(@$COMP_LIST);
+    if ($n == 0) {
+        set_msg("No completions.");
+        return;
+    }
+    if ($n == 1) {
+        # Single match - insert immediately
+        my str $word = $COMP_LIST->[0];
+        if ($word eq $COMP_PREFIX) {
+            set_msg("Sole completion.");
+            return;
+        }
+        undo_save();
+        my str $line = get_line($CY);
+        my int $ps = $CX - length($COMP_PREFIX);
+        my str $before = substr($line, 0, $ps);
+        my str $after = "";
+        if ($CX < length($line)) { $after = substr($line, $CX); }
+        set_line($CY, $before . $word . $after);
+        $CX = $ps + length($word);
+        $DIRTY = 1;
+        set_msg("");
+        return;
+    }
+    $COMP_ACTIVE = 1;
+    $COMP_IDX = 0;
+    $COMP_SCROLL = 0;
+    comp_anchor();
+    set_msg("Completions: " . $n);
+}
+
+func comp_accept() void {
+    if (scalar(@$COMP_LIST) == 0) {
+        $COMP_ACTIVE = 0;
+        return;
+    }
+    undo_save();
+    my str $word = $COMP_LIST->[$COMP_IDX];
+    my str $line = get_line($CY);
+    my int $ps = $CX - length($COMP_PREFIX);
+    my str $before = substr($line, 0, $ps);
+    my str $after = "";
+    if ($CX < length($line)) { $after = substr($line, $CX); }
+    set_line($CY, $before . $word . $after);
+    $CX = $ps + length($word);
+    $DIRTY = 1;
+    $COMP_ACTIVE = 0;
+    set_msg("");
+}
+
+func comp_dismiss() void {
+    $COMP_ACTIVE = 0;
+    $COMP_LIST = [];
+    $COMP_IDX = 0;
+    set_msg("");
+}
+
+func comp_update() void {
+    $COMP_PREFIX = comp_find_prefix();
+    if (length($COMP_PREFIX) == 0) {
+        comp_dismiss();
+        return;
+    }
+    $COMP_LIST = comp_gather($COMP_PREFIX);
+    if (scalar(@$COMP_LIST) == 0) {
+        comp_dismiss();
+        return;
+    }
+    $COMP_IDX = 0;
+    $COMP_SCROLL = 0;
+    comp_anchor();
+}
+
+# ===========================================================================
 # Syntax Highlighting
 # ===========================================================================
 
 func syn_init() void {
     $SYN_KEYWORDS = {};
-
-    # -- C keywords --
-    my scalar $ckw = {};
-    my str $c_kw = "auto break case const continue default do else enum extern for goto if inline register restrict return sizeof static struct switch typedef union unsigned volatile while";
-    my str $c_types = "void int char short long float double signed size_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t FILE";
-    my str $c_preproc = "#include #define #ifdef #ifndef #endif #else #elif #pragma #undef #if #error #warning";
-
-    my array @kw = split(" ", $c_kw);
-    my int $i = 0;
-    while ($i < scalar(@kw)) {
-        $ckw->{$kw[$i]} = "33";
-        $i = $i + 1;
-    }
-    my array @ty = split(" ", $c_types);
-    $i = 0;
-    while ($i < scalar(@ty)) {
-        $ckw->{$ty[$i]} = "36";
-        $i = $i + 1;
-    }
-    my array @pp = split(" ", $c_preproc);
-    $i = 0;
-    while ($i < scalar(@pp)) {
-        $ckw->{$pp[$i]} = "34";
-        $i = $i + 1;
-    }
-    $SYN_KEYWORDS->{"c"} = $ckw;
-
-    # -- Perl keywords --
-    my scalar $pkw = {};
-    my str $p_kw = "my our local sub use require if elsif else unless while until for foreach return last next redo die warn print say push pop shift unshift chomp chop split join grep map sort keys values exists delete defined ref bless package qw BEGIN END eval do";
-    my str $p_types = "scalar array hash int str";
-
-    my array @pk = split(" ", $p_kw);
-    $i = 0;
-    while ($i < scalar(@pk)) {
-        $pkw->{$pk[$i]} = "33";
-        $i = $i + 1;
-    }
-    my array @pt = split(" ", $p_types);
-    $i = 0;
-    while ($i < scalar(@pt)) {
-        $pkw->{$pt[$i]} = "36";
-        $i = $i + 1;
-    }
-    $SYN_KEYWORDS->{"perl"} = $pkw;
-
-    # -- Strada keywords --
-    my scalar $skw = {};
-    my str $s_kw = "func fn my our if elsif else unless while until for foreach return last next redo die warn say print push pop shift unshift split join keys values exists delete defined package use import_lib import_object import_archive has ro rw extends with before after around try catch throw async await const enum private BEGIN END bless";
-    my str $s_types = "int num str scalar array hash void dynamic int8 int16 uint8 byte uint16 uint32 uint64 size_t char float double";
-    my str $s_special = "__C__ __PACKAGE__ __FILE__ __LINE__";
-
-    my array @sk = split(" ", $s_kw);
-    $i = 0;
-    while ($i < scalar(@sk)) {
-        $skw->{$sk[$i]} = "33";
-        $i = $i + 1;
-    }
-    my array @st = split(" ", $s_types);
-    $i = 0;
-    while ($i < scalar(@st)) {
-        $skw->{$st[$i]} = "36";
-        $i = $i + 1;
-    }
-    my array @ss = split(" ", $s_special);
-    $i = 0;
-    while ($i < scalar(@ss)) {
-        $skw->{$ss[$i]} = "35;1";
-        $i = $i + 1;
-    }
-    $SYN_KEYWORDS->{"strada"} = $skw;
 }
 
 func syn_detect(str $filename) str {
@@ -2541,6 +2792,65 @@ func render() void {
         }
     }
 
+    # Completion popup overlay
+    if ($COMP_ACTIVE == 1 && scalar(@$COMP_LIST) > 0) {
+        my int $max_visible = 8;
+        my int $total = scalar(@$COMP_LIST);
+        my int $visible = $total;
+        if ($visible > $max_visible) { $visible = $max_visible; }
+
+        my int $pop_row = $COMP_ROW;
+        my int $pop_col = $COMP_COL;
+
+        # Find max width of candidates for uniform popup
+        my int $max_w = 0;
+        my int $mwi = 0;
+        while ($mwi < $total) {
+            my int $wlen = length($COMP_LIST->[$mwi]);
+            if ($wlen > $max_w) { $max_w = $wlen; }
+            $mwi = $mwi + 1;
+        }
+        $max_w = $max_w + 2;
+        if ($max_w < 12) { $max_w = 12; }
+
+        # Clamp to screen bounds
+        if ($pop_col + $max_w > $COLS) {
+            $pop_col = $COLS - $max_w + 1;
+            if ($pop_col < 1) { $pop_col = 1; }
+        }
+        # Flip above cursor if no room below
+        if ($pop_row + $visible > $ROWS - 1) {
+            $pop_row = $COMP_ROW - $visible - 1;
+            if ($pop_row < 1) { $pop_row = 1; }
+        }
+
+        my int $ri = 0;
+        while ($ri < $visible) {
+            my int $idx = $COMP_SCROLL + $ri;
+            if ($idx < $total) {
+                my str $entry = $COMP_LIST->[$idx];
+                my int $scr_r = $pop_row + $ri;
+                $out = $out . $E . "[" . $scr_r . ";" . $pop_col . "H";
+
+                if ($idx == $COMP_IDX) {
+                    $out = $out . $E . "[7m";
+                } else {
+                    $out = $out . $E . "[46;30m";
+                }
+
+                $out = $out . " " . $entry;
+                my int $pad = $max_w - length($entry) - 1;
+                my int $pi = 0;
+                while ($pi < $pad) {
+                    $out = $out . " ";
+                    $pi = $pi + 1;
+                }
+                $out = $out . $E . "[0m";
+            }
+            $ri = $ri + 1;
+        }
+    }
+
     # Position cursor in active window
     my int $screen_y = $CY - $SY + $active_top + 1;
     my str $cur_line = get_line($CY);
@@ -2622,6 +2932,7 @@ func move_buf_end() void {
 }
 
 func move_forward_word() void {
+    my int $n = line_count();
     my str $line = get_line($CY);
     my int $ll = length($line);
     # Skip current word chars
@@ -2632,14 +2943,44 @@ func move_forward_word() void {
     while ($CX < $ll && is_word_char(u8_char_at($line, $CX)) == 0) {
         $CX = u8_next($line, $CX);
     }
+    # If at end of line, jump to next line's first word
+    if ($CX >= $ll && $CY + 1 < $n) {
+        $CY = $CY + 1;
+        $CX = 0;
+        $line = get_line($CY);
+        $ll = length($line);
+        # Skip leading non-word chars on new line
+        while ($CX < $ll && is_word_char(u8_char_at($line, $CX)) == 0) {
+            $CX = u8_next($line, $CX);
+        }
+        scroll_adjust();
+    }
 }
 
 func move_backward_word() void {
     my str $line = get_line($CY);
+    # If at beginning of line, jump to end of previous line
+    if ($CX == 0 && $CY > 0) {
+        $CY = $CY - 1;
+        $line = get_line($CY);
+        $CX = length($line);
+        scroll_adjust();
+    }
     if ($CX > 0) { $CX = u8_prev($line, $CX); }
     # Skip non-word chars
     while ($CX > 0 && is_word_char(u8_char_at($line, $CX)) == 0) {
         $CX = u8_prev($line, $CX);
+    }
+    # If we're at position 0 and it's not a word char, try previous line
+    if ($CX == 0 && is_word_char(u8_char_at($line, 0)) == 0 && $CY > 0) {
+        $CY = $CY - 1;
+        $line = get_line($CY);
+        $CX = length($line);
+        scroll_adjust();
+        if ($CX > 0) { $CX = u8_prev($line, $CX); }
+        while ($CX > 0 && is_word_char(u8_char_at($line, $CX)) == 0) {
+            $CX = u8_prev($line, $CX);
+        }
     }
     # Skip word chars
     while ($CX > 0) {
@@ -3858,12 +4199,13 @@ func complete_buffer(str $input) array {
 func complete_mx(str $input) array {
     my array @cmds = ("replace-regexp", "refresh-buffer", "revert-buffer",
         "query-replace", "replace-string", "goto-line", "set-syntax",
-        "load-vim-syntax", "what-cursor-position", "kill-buffer",
+        "load-vim-syntax", "load-completions", "what-cursor-position", "kill-buffer",
         "find-file", "switch-buffer", "list-buffers",
         "line-numbers-mode", "which-function-mode",
         "indent-tabs-mode", "set-tab-width",
         "tabify", "untabify", "count-words", "count-lines",
         "fill-paragraph", "set-fill-column", "hex-mode",
+        "completion-mode", "reload-completions",
         "text-mode", "strada-mode", "c-mode", "perl-mode",
         "python-mode", "javascript-mode", "html-mode", "css-mode",
         "shell-mode", "makefile-mode", "markdown-mode");
@@ -4227,7 +4569,7 @@ func cmd_isearch() void {
         if (length($key) == 0) {
             next;
         }
-        if ($key eq "RET" || $key eq "ESC" || $key eq "UP" || $key eq "DOWN" || $key eq "C-n" || $key eq "C-p") {
+        if ($key eq "RET" || $key eq "ESC" || $key eq "UP" || $key eq "DOWN" || $key eq "C-n" || $key eq "C-p" || $key eq "LEFT" || $key eq "RIGHT" || $key eq "C-f" || $key eq "C-b") {
             if (length($query) > 0) {
                 $LAST_SEARCH = $query;
             }
@@ -4346,6 +4688,30 @@ func search_next(str $query, int $dir, int $advance) void {
             if ($y >= 0) {
                 $x = length(get_line($y));
             }
+        }
+        # Wrap around from bottom
+        $y = $n - 1;
+        while ($y >= $start_y) {
+            my str $line = get_line($y);
+            my int $max_x = length($line);
+            if ($y == $start_y) { $max_x = $start_x; }
+            my str $region = substr($line, 0, $max_x);
+            my int $pos = -1;
+            my int $search_from = 0;
+            while (1) {
+                my int $found = index(substr($region, $search_from), $query);
+                if ($found == -1) { last; }
+                $pos = $search_from + $found;
+                $search_from = $pos + 1;
+            }
+            if ($pos >= 0) {
+                $CY = $y;
+                $CX = $pos;
+                scroll_adjust();
+                set_msg("Wrapped.");
+                return;
+            }
+            $y = $y - 1;
         }
         set_msg("Not found: " . $query);
     }
@@ -4519,6 +4885,26 @@ func cmd_mx() void {
         }
         return;
     }
+    if ($cmd eq "load-completions") {
+        my str $cpath = mb_read("Completion file: ");
+        if (length($cpath) > 0) {
+            $cpath = expand_tilde($cpath);
+            my int $cslash = -1;
+            my int $csi = 0;
+            while ($csi < length($cpath)) {
+                if (substr($cpath, $csi, 1) eq "/") { $cslash = $csi; }
+                $csi = $csi + 1;
+            }
+            my str $cbase = $cpath;
+            if ($cslash >= 0) { $cbase = substr($cpath, $cslash + 1); }
+            my int $cdot = index($cbase, ".");
+            my str $clang = $cbase;
+            if ($cdot > 0) { $clang = substr($cbase, 0, $cdot); }
+            comp_load_file($cpath, $clang);
+            set_msg("Loaded completions for: " . $clang);
+        }
+        return;
+    }
     if ($cmd eq "load-vim-syntax") {
         my str $path = mb_read("Vim syntax file: ");
         if (length($path) > 0) {
@@ -4673,6 +5059,26 @@ func cmd_mx() void {
             hex_leave_mode();
         } else {
             hex_enter_mode();
+        }
+        return;
+    }
+    if ($cmd eq "completion-mode") {
+        if ($COMP_MODE == 0) {
+            $COMP_MODE = 1;
+            set_msg("Completion mode enabled.");
+        } else {
+            $COMP_MODE = 0;
+            comp_dismiss();
+            set_msg("Completion mode disabled.");
+        }
+        return;
+    }
+    if ($cmd eq "reload-completions") {
+        if (length($COMP_DIR) > 0) {
+            $COMP_DEFS = {};
+            comp_load_dir($COMP_DIR);
+        } else {
+            set_msg("No complete-dir configured.");
         }
         return;
     }
@@ -5212,6 +5618,7 @@ func describe_key(str $dk) void {
     if ($dk eq "M-w") { set_msg("M-w: copy-region"); return; }
     if ($dk eq "M-d") { set_msg("M-d: kill-word"); return; }
     if ($dk eq "M-q") { set_msg("M-q: fill-paragraph"); return; }
+    if ($dk eq "M-TAB") { set_msg("M-TAB: autocomplete"); return; }
     if ($dk eq "M-x") { set_msg("M-x: execute-command"); return; }
     if ($dk eq "M-%") { set_msg("M-%: query-replace"); return; }
     if ($dk eq "M-g") { set_msg("M-g: goto-line"); return; }
@@ -5357,6 +5764,7 @@ func show_help_bindings() void {
     push(@$lines, "  M-d             Kill word forward");
     push(@$lines, "  M-q             Fill paragraph");
     push(@$lines, "  M-Backspace     Kill word backward");
+    push(@$lines, "  M-TAB           Autocomplete");
     push(@$lines, "  C-_  / C-/      Undo");
     push(@$lines, "  C-o             Other window / Open line");
     push(@$lines, "  TAB             Indent / insert tab");
@@ -5399,6 +5807,7 @@ func show_help_bindings() void {
     push(@$lines, "  load-vim-syntax, what-cursor-position,");
     push(@$lines, "  line-numbers-mode, which-function-mode,");
     push(@$lines, "  hex-mode (toggle hex editor view)");
+    push(@$lines, "  reload-completions (reload .complete files)");
 
     # Switch to help buffer
     buf_save_state();
@@ -5423,6 +5832,53 @@ func handle_key(str $key) void {
         return;
     }
 
+    # Completion popup active - intercept keys
+    if ($COMP_ACTIVE == 1) {
+        if ($key eq "C-n" || $key eq "DOWN") {
+            if ($COMP_IDX < scalar(@$COMP_LIST) - 1) {
+                $COMP_IDX = $COMP_IDX + 1;
+            }
+            my int $max_vis = 8;
+            if ($COMP_IDX >= $COMP_SCROLL + $max_vis) {
+                $COMP_SCROLL = $COMP_IDX - $max_vis + 1;
+            }
+            return;
+        }
+        if ($key eq "C-p" || $key eq "UP") {
+            if ($COMP_IDX > 0) {
+                $COMP_IDX = $COMP_IDX - 1;
+            }
+            if ($COMP_IDX < $COMP_SCROLL) {
+                $COMP_SCROLL = $COMP_IDX;
+            }
+            return;
+        }
+        if ($key eq "RET" || $key eq "TAB") {
+            comp_accept();
+            return;
+        }
+        if ($key eq "C-g" || $key eq "ESC") {
+            comp_dismiss();
+            return;
+        }
+        if ($key eq "BACKSPACE") {
+            comp_dismiss();
+            edit_backspace();
+            return;
+        }
+        # Printable chars: insert then update the completion list
+        if (length($key) == 1) {
+            my int $kcode = ord($key);
+            if ($kcode >= 32 && $kcode <= 126) {
+                edit_insert($key);
+                comp_update();
+                return;
+            }
+        }
+        # Any other key: dismiss and fall through
+        comp_dismiss();
+    }
+
     # ESC as pending Meta prefix (for slow ESC + key)
     if ($key eq "ESC") {
         set_msg("ESC-");
@@ -5440,6 +5896,8 @@ func handle_key(str $key) void {
         # Convert to Meta key
         if (length($next) == 1) {
             handle_key("M-" . $next);
+        } elsif ($next eq "TAB") {
+            handle_key("M-TAB");
         } else {
             handle_key($next);
         }
@@ -5524,6 +5982,7 @@ func handle_key(str $key) void {
     if ($key eq "M-BACKSPACE") { edit_backward_kill_word(); return; }
     if ($key eq "M-d") { edit_forward_kill_word(); return; }
     if ($key eq "M-q") { fill_paragraph(); return; }
+    if ($key eq "M-TAB") { comp_start(); return; }
     if ($key eq "M-x") { cmd_mx(); return; }
     if ($key eq "M-%") { cmd_query_replace(); return; }
     if ($key eq "M-g") {
@@ -5607,6 +6066,16 @@ func main() int {
     $LAST_SEARCH = "";
     $LAST_BUFFER = "";
     $SYN_EXT_MAP = {};
+    $COMP_ACTIVE = 0;
+    $COMP_LIST = [];
+    $COMP_IDX = 0;
+    $COMP_PREFIX = "";
+    $COMP_ROW = 0;
+    $COMP_COL = 0;
+    $COMP_SCROLL = 0;
+    $COMP_DEFS = {};
+    $COMP_DIR = "";
+    $COMP_MODE = 0;
     $HEX_MODE = 0;
     $HEX_BYTE_POS = 0;
     $HEX_IN_ASCII = 0;
@@ -5614,8 +6083,94 @@ func main() int {
     $HEX_PREV_MODE = "";
     $HEX_PREV_SYNTAX = "";
 
+    # Open files from command line args
+    my array @args = core::argv();
+    my int $argc = scalar(@args);
+
+    # Check for --help / --version before entering TUI
+    if ($argc > 1) {
+        if ($args[1] eq "--help" || $args[1] eq "-h") {
+            say("smacs - a lightweight Emacs-like text editor");
+            say("");
+            say("Usage: smacs [OPTIONS] [FILE ...]");
+            say("");
+            say("Options:");
+            say("  -h, --help              Show this help and exit");
+            say("  -v, --version           Show version and exit");
+            say("  --syntax FILE.vim       Load a vim syntax highlighting file");
+            say("  --complete FILE.complete  Load a completion definition file");
+            say("  --completion-mode       Enable code completion (M-TAB)");
+            say("");
+            say("Configuration:");
+            say("  /etc/smacsrc            System-wide config");
+            say("  ~/.smacsrc              User config (key = value format)");
+            say("  ~/.smacs/complete/      Default completion definitions directory");
+            say("");
+            say("Key bindings (partial list):");
+            say("  C-x C-s    Save          C-x C-f    Open file");
+            say("  C-x C-c    Quit          C-x b      Switch buffer");
+            say("  C-s        Search        M-%        Query replace");
+            say("  C-x 2      Split horiz   C-x 3      Split vertical");
+            say("  C-x o      Other window  M-TAB      Autocomplete");
+            say("  C-z        Suspend       C-h b      Full key list");
+            say("  M-x        Run command");
+            say("");
+            say("Report bugs: https://github.com/strada-lang/smacs");
+            return 0;
+        }
+        if ($args[1] eq "--version" || $args[1] eq "-v") {
+            say("smacs 0.1");
+            return 0;
+        }
+    }
+
     syn_init();
     load_config();
+
+    # Auto-load syntax files from standard locations (if not already loaded via config)
+    if (!defined($VIM_SYN)) {
+        # Try installed location, then local dev directory
+        my array @syn_dirs = ("/usr/local/share/smacs/syntax", "/usr/share/smacs/syntax", "./syntax");
+        my int $sdi = 0;
+        while ($sdi < scalar(@syn_dirs)) {
+            my str $sd = $syn_dirs[$sdi];
+            my array @test_syn = core::readdir($sd . "/syntax");
+            if (scalar(@test_syn) > 0) {
+                load_syntax_dir($sd);
+                last;
+            }
+            # Also try flat directory
+            my array @test_flat = core::readdir($sd);
+            if (scalar(@test_flat) > 0) {
+                load_syntax_dir($sd);
+                last;
+            }
+            $sdi = $sdi + 1;
+        }
+    }
+
+    # Auto-load completions from standard locations (if not already loaded via config)
+    if (length($COMP_DIR) == 0) {
+        my str $home = core::getenv("HOME");
+        my array @comp_dirs = ();
+        if (length($home) > 0) {
+            push(@comp_dirs, $home . "/.smacs/complete");
+        }
+        push(@comp_dirs, "/usr/local/share/smacs/complete");
+        push(@comp_dirs, "/usr/share/smacs/complete");
+        push(@comp_dirs, "./complete");
+        my int $cdi = 0;
+        while ($cdi < scalar(@comp_dirs)) {
+            my str $cd = $comp_dirs[$cdi];
+            my array @test_comp = core::readdir($cd);
+            if (scalar(@test_comp) > 0) {
+                $COMP_DIR = $cd;
+                comp_load_dir($COMP_DIR);
+                last;
+            }
+            $cdi = $cdi + 1;
+        }
+    }
 
     enable_raw();
     update_size();
@@ -5627,17 +6182,32 @@ func main() int {
     # Initialize window system
     win_init();
 
-    # Open files from command line args
-    my array @args = core::argv();
-    my int $argc = scalar(@args);
     if ($argc > 1) {
         my int $i = 1;
         while ($i < $argc) {
             my str $path = $args[$i];
-            if ($path eq "--syntax" && $i + 1 < $argc) {
+            if ($path eq "--completion-mode") {
+                $COMP_MODE = 1;
+            } elsif ($path eq "--syntax" && $i + 1 < $argc) {
                 # --syntax file.vim
                 $i = $i + 1;
                 vim_syntax_load($args[$i]);
+            } elsif ($path eq "--complete" && $i + 1 < $argc) {
+                # --complete lang.complete
+                $i = $i + 1;
+                my str $cpath = $args[$i];
+                my int $cslash = -1;
+                my int $csi = 0;
+                while ($csi < length($cpath)) {
+                    if (substr($cpath, $csi, 1) eq "/") { $cslash = $csi; }
+                    $csi = $csi + 1;
+                }
+                my str $cbase = $cpath;
+                if ($cslash >= 0) { $cbase = substr($cpath, $cslash + 1); }
+                my int $cdot = index($cbase, ".");
+                my str $clang = $cbase;
+                if ($cdot > 0) { $clang = substr($cbase, 0, $cdot); }
+                comp_load_file($cpath, $clang);
             } else {
                 if ($i == 1) {
                     # Replace scratch buffer with first file
