@@ -2011,6 +2011,63 @@ func vim_syntax_load(str $path) void {
     }
     core::close($fh);
 
+    # Compute highlighter metadata from loaded syntax data
+    $syn->{"line_comment"} = "";
+    $syn->{"has_block_comment"} = 0;
+    $syn->{"has_preproc"} = 0;
+    $syn->{"has_sigils"} = 0;
+
+    my scalar $s_links = $syn->{"links"};
+    my scalar $s_matches = $syn->{"matches"};
+    my scalar $s_regions = $syn->{"regions"};
+    my array @lk = keys(%$s_links);
+    my int $li = 0;
+    while ($li < scalar(@lk)) {
+        my str $gname = $lk[$li];
+        my str $target = $s_links->{$gname};
+        # Follow one level of link indirection
+        my str $terminal = $target;
+        if (defined($s_links->{$terminal})) {
+            $terminal = $s_links->{$terminal};
+        }
+
+        # Detect comment style
+        if ($terminal eq "Comment" || $target eq "Comment") {
+            if (defined($s_matches->{$gname})) {
+                my str $pat = $s_matches->{$gname};
+                if (index($pat, "#") == 0) {
+                    $syn->{"line_comment"} = "#";
+                } elsif (index($pat, "//") == 0) {
+                    $syn->{"line_comment"} = "//";
+                }
+            }
+            if (defined($s_regions->{$gname})) {
+                my scalar $reg = $s_regions->{$gname};
+                my str $sp = $reg->{"start"};
+                if (index($sp, "/*") >= 0 || index($sp, "/\\*") >= 0) {
+                    $syn->{"has_block_comment"} = 1;
+                }
+            }
+        }
+
+        # Detect preprocessor
+        if ($terminal eq "PreProc" || $target eq "PreProc") {
+            $syn->{"has_preproc"} = 1;
+        }
+
+        # Detect sigil variables
+        if ($terminal eq "Identifier" || $target eq "Identifier") {
+            if (defined($s_matches->{$gname})) {
+                my str $pat = $s_matches->{$gname};
+                if (index($pat, "$") >= 0 || index($pat, "@") >= 0 || index($pat, "%") >= 0) {
+                    $syn->{"has_sigils"} = 1;
+                }
+            }
+        }
+
+        $li = $li + 1;
+    }
+
     # Detect language from filename
     my str $lang = syn_detect($path);
     if (length($lang) == 0) {
@@ -2107,29 +2164,296 @@ func vim_highlight(str $line, str $lang) str {
 
     my scalar $syn = $VIM_SYN->{$lang};
     my scalar $kw_groups = $syn->{"keywords"};
+    my str $line_comment = $syn->{"line_comment"};
+    my int $has_block = $syn->{"has_block_comment"};
+    my int $has_preproc = $syn->{"has_preproc"};
+    my int $has_sigils = $syn->{"has_sigils"};
+    my int $lc_len = length($line_comment);
+
     my str $reset = $E . "[0m";
+    # Resolve standard colors once
+    my str $col_comment = vim_resolve_color($syn, "Comment");
+    my str $col_string = vim_resolve_color($syn, "String");
+    my str $col_number = vim_resolve_color($syn, "Number");
+    my str $col_special = vim_resolve_color($syn, "Special");
+    my str $col_ident = vim_resolve_color($syn, "Identifier");
+    my str $col_func = vim_resolve_color($syn, "Function");
+    my str $col_preproc = vim_resolve_color($syn, "PreProc");
+    my str $col_label = vim_resolve_color($syn, "Label");
+    # Fallbacks
+    if (length($col_comment) == 0) { $col_comment = "90"; }
+    if (length($col_string) == 0) { $col_string = "32"; }
+    if (length($col_number) == 0) { $col_number = "35"; }
+    if (length($col_special) == 0) { $col_special = "35"; }
+    if (length($col_ident) == 0) { $col_ident = "36;1"; }
+    if (length($col_func) == 0) { $col_func = "33;1"; }
+    if (length($col_preproc) == 0) { $col_preproc = "34"; }
+    if (length($col_label) == 0) { $col_label = "33"; }
+
     my str $out = "";
     my int $i = 0;
     my int $len = length($line);
 
+    # Preprocessor: entire line colored if starts with # (C-style)
+    if ($has_preproc == 1) {
+        my int $ti = 0;
+        while ($ti < $len && (substr($line, $ti, 1) eq " " || substr($line, $ti, 1) eq "\t")) {
+            $ti = $ti + 1;
+        }
+        if ($ti < $len && substr($line, $ti, 1) eq "#") {
+            return $E . "[" . $col_preproc . "m" . $line . $reset;
+        }
+    }
+
     while ($i < $len) {
         my str $ch = substr($line, $i, 1);
 
-        # Keywords
+        # ---- Line comments ----
+        if ($lc_len == 1 && $ch eq $line_comment) {
+            $out = $out . $E . "[" . $col_comment . "m" . substr($line, $i) . $reset;
+            return $out;
+        }
+        if ($lc_len == 2 && $i + 1 < $len && substr($line, $i, 2) eq $line_comment) {
+            $out = $out . $E . "[" . $col_comment . "m" . substr($line, $i) . $reset;
+            return $out;
+        }
+
+        # ---- Block comments /* ... */ ----
+        if ($has_block == 1 && $ch eq "/" && $i + 1 < $len && substr($line, $i + 1, 1) eq "*") {
+            my str $bc = $E . "[" . $col_comment . "m/*";
+            my int $bi = $i + 2;
+            my int $closed = 0;
+            while ($bi < $len) {
+                if ($bi + 1 < $len && substr($line, $bi, 1) eq "*" && substr($line, $bi + 1, 1) eq "/") {
+                    $bc = $bc . "*/" . $reset;
+                    $bi = $bi + 2;
+                    $closed = 1;
+                    last;
+                }
+                my int $bni = u8_next($line, $bi);
+                $bc = $bc . substr($line, $bi, $bni - $bi);
+                $bi = $bni;
+            }
+            if ($closed == 0) { $bc = $bc . $reset; }
+            $out = $out . $bc;
+            $i = $bi;
+            next;
+        }
+
+        # ---- Double-quoted strings ----
+        if ($ch eq "\"") {
+            my str $sc = $E . "[" . $col_string . "m\"";
+            $i = $i + 1;
+            my int $str_done = 0;
+            while ($i < $len) {
+                my str $sch = substr($line, $i, 1);
+                if ($sch eq "\\" && $i + 1 < $len) {
+                    # Escape sequence
+                    $sc = $sc . $reset . $E . "[" . $col_special . "m" . $sch . substr($line, $i + 1, 1) . $reset . $E . "[" . $col_string . "m";
+                    $i = $i + 2;
+                } elsif ($sch eq "\"") {
+                    $sc = $sc . "\"" . $reset;
+                    $i = $i + 1;
+                    $str_done = 1;
+                    last;
+                } elsif ($has_sigils == 1 && ($sch eq "$" || $sch eq "@") && $i + 1 < $len && is_word_char(u8_char_at($line, $i + 1)) == 1) {
+                    # Interpolated variable inside string
+                    my int $vs = $i;
+                    $i = $i + 1;
+                    while ($i < $len && is_word_char(u8_char_at($line, $i)) == 1) {
+                        $i = u8_next($line, $i);
+                    }
+                    $sc = $sc . $reset . $E . "[" . $col_special . "m" . substr($line, $vs, $i - $vs) . $reset . $E . "[" . $col_string . "m";
+                } else {
+                    my int $sni = u8_next($line, $i);
+                    $sc = $sc . substr($line, $i, $sni - $i);
+                    $i = $sni;
+                }
+            }
+            if ($str_done == 0) { $sc = $sc . $reset; }
+            $out = $out . $sc;
+            next;
+        }
+
+        # ---- Single-quoted strings ----
+        if ($ch eq "'") {
+            my str $sc = $E . "[" . $col_string . "m'";
+            $i = $i + 1;
+            my int $str_done = 0;
+            while ($i < $len) {
+                my str $sch = substr($line, $i, 1);
+                if ($sch eq "\\" && $i + 1 < $len) {
+                    $sc = $sc . $sch . substr($line, $i + 1, 1);
+                    $i = $i + 2;
+                } elsif ($sch eq "'") {
+                    $sc = $sc . "'" . $reset;
+                    $i = $i + 1;
+                    $str_done = 1;
+                    last;
+                } else {
+                    my int $sni = u8_next($line, $i);
+                    $sc = $sc . substr($line, $i, $sni - $i);
+                    $i = $sni;
+                }
+            }
+            if ($str_done == 0) { $sc = $sc . $reset; }
+            $out = $out . $sc;
+            next;
+        }
+
+        # ---- References: \$var, \@arr, \%hash ----
+        if ($has_sigils == 1 && $ch eq "\\" && $i + 2 < $len) {
+            my str $nch = substr($line, $i + 1, 1);
+            if (($nch eq "$" || $nch eq "@" || $nch eq "%") && is_word_char(u8_char_at($line, $i + 2)) == 1) {
+                my int $ni = $i + 2;
+                while ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                    $ni = u8_next($line, $ni);
+                }
+                $out = $out . $E . "[" . $col_special . "m" . substr($line, $i, $ni - $i) . $reset;
+                $i = $ni;
+                next;
+            }
+        }
+
+        # ---- Sigil variables: $name, @name, %name ----
+        if ($has_sigils == 1 && ($ch eq "$" || $ch eq "@" || $ch eq "%")) {
+            my int $ni = $i + 1;
+            if ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                while ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                    $ni = u8_next($line, $ni);
+                }
+                $out = $out . $E . "[" . $col_ident . "m" . substr($line, $i, $ni - $i) . $reset;
+                $i = $ni;
+                next;
+            }
+            # Special variables: $_, @_, $!, $@, $/, $0
+            if ($ch eq "$" && $ni < $len) {
+                my str $snch = substr($line, $ni, 1);
+                if ($snch eq "_" || $snch eq "!" || $snch eq "@" || $snch eq "/" || $snch eq "0" || $snch eq "{") {
+                    $out = $out . $E . "[" . $col_special . "m" . $ch . $snch . $reset;
+                    $i = $ni + 1;
+                    next;
+                }
+            }
+            if ($ch eq "@" && $ni < $len && substr($line, $ni, 1) eq "_") {
+                $out = $out . $E . "[" . $col_special . "m" . "@_" . $reset;
+                $i = $ni + 1;
+                next;
+            }
+        }
+
+        # ---- Method calls: ->name ----
+        if ($ch eq "-" && $i + 2 < $len && substr($line, $i + 1, 1) eq ">") {
+            my int $ni = $i + 2;
+            if (is_word_char(u8_char_at($line, $ni)) == 1) {
+                while ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                    $ni = u8_next($line, $ni);
+                }
+                $out = $out . "->" . $E . "[" . $col_func . "m" . substr($line, $i + 2, $ni - $i - 2) . $reset;
+                $i = $ni;
+                next;
+            }
+        }
+
+        # ---- Words: keywords, numbers, namespaces, labels ----
         if (is_word_char($ch) == 1) {
             my int $start = $i;
             while ($i < $len && is_word_char(u8_char_at($line, $i)) == 1) {
                 $i = u8_next($line, $i);
             }
             my str $word = substr($line, $start, $i - $start);
+            my str $fc = substr($word, 0, 1);
+
+            # Numbers: starts with digit
+            if ($fc ge "0" && $fc le "9") {
+                $out = $out . $E . "[" . $col_number . "m" . $word . $reset;
+                # Consume float: .digits after number
+                if ($i < $len && substr($line, $i, 1) eq ".") {
+                    my int $di = $i + 1;
+                    if ($di < $len && substr($line, $di, 1) ge "0" && substr($line, $di, 1) le "9") {
+                        while ($di < $len && is_word_char(u8_char_at($line, $di)) == 1) {
+                            $di = u8_next($line, $di);
+                        }
+                        $out = $out . $E . "[" . $col_number . "m" . substr($line, $i, $di - $i) . $reset;
+                        $i = $di;
+                    }
+                }
+                next;
+            }
+
+            # Namespace calls: word::word
+            if ($i + 1 < $len && substr($line, $i, 2) eq "::") {
+                my int $ni = $i + 2;
+                if ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                    while ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                        $ni = u8_next($line, $ni);
+                    }
+                    my str $fname = substr($line, $i + 2, $ni - $i - 2);
+                    $out = $out . $E . "[" . $col_special . "m" . $word . "::" . $reset . $E . "[" . $col_func . "m" . $fname . $reset;
+                    $i = $ni;
+                    next;
+                }
+            }
+
+            # Labels: ALLCAPS: at start of line
+            if ($start == 0 && $i < $len && substr($line, $i, 1) eq ":") {
+                my int $is_label = 1;
+                my int $ci = 0;
+                while ($ci < length($word)) {
+                    my str $wc = substr($word, $ci, 1);
+                    if (!(($wc ge "A" && $wc le "Z") || $wc eq "_" || ($wc ge "0" && $wc le "9"))) {
+                        $is_label = 0;
+                        last;
+                    }
+                    $ci = $ci + 1;
+                }
+                if ($is_label == 1) {
+                    $out = $out . $E . "[" . $col_label . "m" . $word . ":" . $reset;
+                    $i = $i + 1;
+                    next;
+                }
+            }
+
+            # Function definitions: func/fn/sub followed by space and name
+            if ($word eq "func" || $word eq "fn" || $word eq "sub") {
+                my str $kw_color = "";
+                my array @groups = keys(%$kw_groups);
+                my int $gi = 0;
+                while ($gi < scalar(@groups)) {
+                    my str $grp = $groups[$gi];
+                    my str $words = $kw_groups->{$grp};
+                    if (index(" " . $words . " ", " " . $word . " ") >= 0) {
+                        $kw_color = vim_resolve_color($syn, $grp);
+                        last;
+                    }
+                    $gi = $gi + 1;
+                }
+                if (length($kw_color) == 0) { $kw_color = "33"; }
+                $out = $out . $E . "[" . $kw_color . "m" . $word . $reset;
+                # Consume whitespace
+                my int $wi = $i;
+                while ($wi < $len && substr($line, $wi, 1) eq " ") {
+                    $wi = $wi + 1;
+                }
+                if ($wi > $i && $wi < $len && is_word_char(u8_char_at($line, $wi)) == 1) {
+                    $out = $out . substr($line, $i, $wi - $i);
+                    my int $ni = $wi;
+                    while ($ni < $len && is_word_char(u8_char_at($line, $ni)) == 1) {
+                        $ni = u8_next($line, $ni);
+                    }
+                    $out = $out . $E . "[" . $col_func . "m" . substr($line, $wi, $ni - $wi) . $reset;
+                    $i = $ni;
+                }
+                next;
+            }
+
+            # Keywords: check each keyword group
             my str $found_color = "";
-            # Check each keyword group
             my array @groups = keys(%$kw_groups);
             my int $gi = 0;
             while ($gi < scalar(@groups)) {
                 my str $grp = $groups[$gi];
                 my str $words = $kw_groups->{$grp};
-                # Check if word is in the word list
                 if (index(" " . $words . " ", " " . $word . " ") >= 0) {
                     $found_color = vim_resolve_color($syn, $grp);
                     last;
@@ -2144,7 +2468,7 @@ func vim_highlight(str $line, str $lang) str {
             next;
         }
 
-        # Non-word: advance by full UTF-8 character
+        # ---- Non-word: advance by full UTF-8 character ----
         my int $ni = u8_next($line, $i);
         $out = $out . substr($line, $i, $ni - $i);
         $i = $ni;
