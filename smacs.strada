@@ -61,6 +61,7 @@ our scalar $SYN_KEYWORDS;   # hash ref: lang -> hash ref of keyword -> color cod
 our scalar $SYN_EXT_MAP;    # hash ref: file extension -> language name
 
 our scalar $UNDO;       # array ref of undo snapshots for current buffer
+our scalar $REDO;       # array ref of redo snapshots for current buffer
 our int $UNDO_MAX;      # max undo entries per buffer
 
 our int $LINUM;         # line numbers mode: 0=off, 1=on
@@ -488,6 +489,7 @@ func buf_new(str $name, str $filename) void {
     $buf->{"syntax"} = syn_detect($filename);
     $buf->{"mode"} = mode_for_syntax(syn_detect($filename));
     $buf->{"undo"} = [];
+    $buf->{"redo"} = [];
     push(@$BUFFERS, $buf);
 }
 
@@ -503,6 +505,7 @@ func buf_save_state() void {
     $buf->{"syntax"} = $SYNTAX;
     $buf->{"mode"} = $MODE;
     $buf->{"undo"} = $UNDO;
+    $buf->{"redo"} = $REDO;
     $buf->{"hex_mode"} = $HEX_MODE;
     $buf->{"hex_byte_pos"} = $HEX_BYTE_POS;
     $buf->{"hex_in_ascii"} = $HEX_IN_ASCII;
@@ -525,6 +528,10 @@ func buf_load_state(int $idx) void {
     $UNDO = $buf->{"undo"};
     if (!defined($UNDO)) {
         $UNDO = [];
+    }
+    $REDO = $buf->{"redo"};
+    if (!defined($REDO)) {
+        $REDO = [];
     }
     $HEX_MODE = $buf->{"hex_mode"};
     if (!defined($HEX_MODE)) { $HEX_MODE = 0; }
@@ -3993,6 +4000,8 @@ func undo_save() void {
     while (scalar(@$UNDO) > $UNDO_MAX) {
         shift(@$UNDO);
     }
+    # Any edit invalidates the redo stack
+    $REDO = [];
 }
 
 func edit_undo() void {
@@ -4000,6 +4009,20 @@ func edit_undo() void {
         set_msg("No further undo information.");
         return;
     }
+    # Save current state to redo stack before restoring
+    my scalar $rsnap = {};
+    $rsnap->{"cy"} = $CY;
+    $rsnap->{"cx"} = $CX;
+    my scalar $rcopy = [];
+    my int $ri = 0;
+    my int $rn = line_count();
+    while ($ri < $rn) {
+        push(@$rcopy, get_line($ri));
+        $ri = $ri + 1;
+    }
+    $rsnap->{"lines"} = $rcopy;
+    push(@$REDO, $rsnap);
+
     my scalar $snap = pop(@$UNDO);
     $CY = $snap->{"cy"};
     $CX = $snap->{"cx"};
@@ -4008,6 +4031,35 @@ func edit_undo() void {
     $CL = $snap->{"lines"};
     $DIRTY = 1;
     set_msg("Undo.");
+}
+
+func edit_redo() void {
+    if (scalar(@$REDO) == 0) {
+        set_msg("No further redo information.");
+        return;
+    }
+    # Save current state to undo stack before restoring
+    my scalar $usnap = {};
+    $usnap->{"cy"} = $CY;
+    $usnap->{"cx"} = $CX;
+    my scalar $ucopy = [];
+    my int $ui = 0;
+    my int $un = line_count();
+    while ($ui < $un) {
+        push(@$ucopy, get_line($ui));
+        $ui = $ui + 1;
+    }
+    $usnap->{"lines"} = $ucopy;
+    push(@$UNDO, $usnap);
+
+    my scalar $snap = pop(@$REDO);
+    $CY = $snap->{"cy"};
+    $CX = $snap->{"cx"};
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"lines"} = $snap->{"lines"};
+    $CL = $snap->{"lines"};
+    $DIRTY = 1;
+    set_msg("Redo.");
 }
 
 # ===========================================================================
@@ -6125,6 +6177,7 @@ func describe_key(str $dk) void {
     if ($dk eq "M-d") { set_msg("M-d: kill-word"); return; }
     if ($dk eq "M-q") { set_msg("M-q: fill-paragraph"); return; }
     if ($dk eq "M-TAB") { set_msg("M-TAB: autocomplete"); return; }
+    if ($dk eq "M-/") { set_msg("M-/: redo"); return; }
     if ($dk eq "M-x") { set_msg("M-x: execute-command"); return; }
     if ($dk eq "M-%") { set_msg("M-%: query-replace"); return; }
     if ($dk eq "M-g") { set_msg("M-g: goto-line"); return; }
@@ -6162,6 +6215,7 @@ func show_help_about() void {
         $abuf->{"syntax"} = "";
         $abuf->{"mode"} = "Help";
         $abuf->{"undo"} = [];
+        $abuf->{"redo"} = [];
         push(@$BUFFERS, $abuf);
         $ai = scalar(@$BUFFERS) - 1;
     }
@@ -6232,6 +6286,7 @@ func show_help_bindings() void {
         $hbuf->{"syntax"} = "";
         $hbuf->{"mode"} = "Help";
         $hbuf->{"undo"} = [];
+        $hbuf->{"redo"} = [];
         $hbuf->{"undo_pos"} = -1;
         push(@$BUFFERS, $hbuf);
         $hi = scalar(@$BUFFERS) - 1;
@@ -6272,6 +6327,7 @@ func show_help_bindings() void {
     push(@$lines, "  M-Backspace     Kill word backward");
     push(@$lines, "  M-TAB           Autocomplete");
     push(@$lines, "  C-_  / C-/      Undo");
+    push(@$lines, "  M-/             Redo");
     push(@$lines, "  C-o             Other window / Open line");
     push(@$lines, "  TAB             Indent / insert tab");
     push(@$lines, "");
@@ -6506,6 +6562,7 @@ func handle_key(str $key) void {
     if ($key eq "M-d") { edit_forward_kill_word(); return; }
     if ($key eq "M-q") { fill_paragraph(); return; }
     if ($key eq "M-TAB") { comp_start(); return; }
+    if ($key eq "M-/") { edit_redo(); return; }
     if ($key eq "M-x") { cmd_mx(); return; }
     if ($key eq "M-%") { cmd_query_replace(); return; }
     if ($key eq "M-g") {
@@ -6577,6 +6634,7 @@ func main() int {
     $MX = 0;
 
     $UNDO = [];
+    $REDO = [];
     $UNDO_MAX = 100;
     $LINUM = 0;
     $TAB_WIDTH = 4;
