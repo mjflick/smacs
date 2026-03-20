@@ -58,6 +58,7 @@ our str $MODE;          # current major mode name (e.g. "Text", "Strada", "C")
 
 our scalar $VIM_SYN;    # hash ref of loaded vim syntax defs, keyed by lang
 our scalar $SYN_KEYWORDS;   # hash ref: lang -> hash ref of keyword -> color code
+our scalar $SYN_EXT_MAP;    # hash ref: file extension -> language name
 
 our scalar $UNDO;       # array ref of undo snapshots for current buffer
 our int $UNDO_MAX;      # max undo entries per buffer
@@ -1053,6 +1054,16 @@ func file_save() void {
 # Config File Support
 # ===========================================================================
 
+func expand_tilde(str $p) str {
+    if (length($p) > 0 && substr($p, 0, 1) eq "~") {
+        my str $home = core::getenv("HOME");
+        if (length($home) > 0) {
+            return $home . substr($p, 1);
+        }
+    }
+    return $p;
+}
+
 # Parse a config file with key=value pairs (lines starting with # are comments)
 func load_config_file(str $path) void {
     my scalar $fh = core::open($path, "r");
@@ -1094,7 +1105,7 @@ func load_config_file(str $path) void {
                     my int $n = core::atoi($val);
                     if ($n > 0) { $UNDO_MAX = $n; }
                 } elsif ($key eq "vim-syntax") {
-                    vim_syntax_load($val);
+                    vim_syntax_load(expand_tilde($val));
                 } elsif ($key eq "tab-width") {
                     my int $tw = core::atoi($val);
                     if ($tw > 0 && $tw <= 16) { $TAB_WIDTH = $tw; }
@@ -1107,6 +1118,16 @@ func load_config_file(str $path) void {
                 } elsif ($key eq "fill-column") {
                     my int $fc = core::atoi($val);
                     if ($fc > 0 && $fc <= 1000) { $FILL_COLUMN = $fc; }
+                } elsif ($key eq "syntax-dir") {
+                    load_syntax_dir(expand_tilde($val));
+                } elsif ($key eq "syntax-ext") {
+                    # Map extension to language: syntax-ext = rs:rust
+                    my int $cp = index($val, ":");
+                    if ($cp > 0) {
+                        my str $ext = substr($val, 0, $cp);
+                        my str $lang = substr($val, $cp + 1);
+                        $SYN_EXT_MAP->{$ext} = $lang;
+                    }
                 } elsif ($key eq "which-function-mode") {
                     if ($val eq "on" || $val eq "true" || $val eq "1") {
                         $WHICH_FUNC = 1;
@@ -1241,6 +1262,10 @@ func syn_detect(str $filename) str {
         return "";
     }
     my str $ext = substr($filename, $dot + 1);
+    # Check dynamic extension map first (from ftdetect files)
+    if (defined($SYN_EXT_MAP) && length("" . $SYN_EXT_MAP->{$ext}) > 0) {
+        return $SYN_EXT_MAP->{$ext};
+    }
     if ($ext eq "c" || $ext eq "h") {
         return "c";
     }
@@ -1466,6 +1491,94 @@ func highlight_line(str $line, str $lang) str {
 # ===========================================================================
 # Vim Syntax File Loading
 # ===========================================================================
+
+func load_ftdetect_dir(str $dir) void {
+    # Read ftdetect/*.vim files for extension-to-language mappings
+    # Handles lines like: au BufRead,BufNewFile *.ext setfiletype lang
+    my str $ftdir = $dir . "/ftdetect";
+    my array @entries = core::readdir($ftdir);
+    my int $i = 0;
+    while ($i < scalar(@entries)) {
+        my str $name = $entries[$i];
+        my int $nlen = length($name);
+        if ($nlen > 4 && substr($name, $nlen - 4) eq ".vim") {
+            my scalar $fh = core::open($ftdir . "/" . $name, "r");
+            if (defined($fh)) {
+                my str $line = <$fh>;
+                while (defined($line)) {
+                    $line = trim($line);
+                    # Parse: au BufRead,BufNewFile *.ext setfiletype lang
+                    # Also:  autocmd BufRead,BufNewFile *.ext set ft=lang
+                    my int $sft = index($line, "setfiletype ");
+                    if ($sft >= 0) {
+                        my str $lang = trim(substr($line, $sft + 12));
+                        # Extract *.ext pattern(s) before setfiletype
+                        my str $before = substr($line, 0, $sft);
+                        # Find patterns like *.ext
+                        my int $bi = 0;
+                        while ($bi < length($before)) {
+                            if (substr($before, $bi, 2) eq "*.") {
+                                my int $end = $bi + 2;
+                                while ($end < length($before) && substr($before, $end, 1) ne " " && substr($before, $end, 1) ne "," && substr($before, $end, 1) ne "\t") {
+                                    $end = $end + 1;
+                                }
+                                my str $ext = substr($before, $bi + 2, $end - $bi - 2);
+                                if (length($ext) > 0) {
+                                    $SYN_EXT_MAP->{$ext} = $lang;
+                                }
+                                $bi = $end;
+                            } else {
+                                $bi = $bi + 1;
+                            }
+                        }
+                    }
+                    $line = <$fh>;
+                }
+                core::close($fh);
+            }
+        }
+        $i = $i + 1;
+    }
+}
+
+func load_syntax_dir(str $dir) void {
+    # First load ftdetect mappings if available
+    load_ftdetect_dir($dir);
+
+    # Then load syntax/*.vim files, or *.vim files directly in dir
+    my str $syndir = $dir . "/syntax";
+    my array @entries = core::readdir($syndir);
+    my int $count = 0;
+    if (scalar(@entries) > 0) {
+        # Has syntax/ subdirectory (standard vim layout)
+        my int $i = 0;
+        while ($i < scalar(@entries)) {
+            my str $name = $entries[$i];
+            my int $nlen = length($name);
+            if ($nlen > 4 && substr($name, $nlen - 4) eq ".vim") {
+                vim_syntax_load($syndir . "/" . $name);
+                $count = $count + 1;
+            }
+            $i = $i + 1;
+        }
+    } else {
+        # Flat directory of .vim files
+        @entries = core::readdir($dir);
+        my int $i = 0;
+        while ($i < scalar(@entries)) {
+            my str $name = $entries[$i];
+            my int $nlen = length($name);
+            if ($nlen > 4 && substr($name, $nlen - 4) eq ".vim") {
+                vim_syntax_load($dir . "/" . $name);
+                $count = $count + 1;
+            }
+            $i = $i + 1;
+        }
+    }
+    if ($count > 0) {
+        set_msg("Loaded " . $count . " syntax files from " . $dir);
+    }
+}
 
 func vim_syntax_load(str $path) void {
     my scalar $fh = core::open($path, "r");
@@ -5493,6 +5606,7 @@ func main() int {
     $FILL_COLUMN = 70;
     $LAST_SEARCH = "";
     $LAST_BUFFER = "";
+    $SYN_EXT_MAP = {};
     $HEX_MODE = 0;
     $HEX_BYTE_POS = 0;
     $HEX_IN_ASCII = 0;

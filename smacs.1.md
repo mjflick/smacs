@@ -1,305 +1,256 @@
-# smacs(1) - lightweight Emacs-like text editor
+smacs(1) -- lightweight Emacs-like text editor
 
-## SYNOPSIS
+# SYNOPSIS
 
-**smacs** [*file* ...]
-**smacs** [**--syntax** *file.vim*] [*file* ...]
+`smacs` [*file* ...]
+`smacs` [`--syntax` *file.vim*] [*file* ...]
 
-## DESCRIPTION
+# DESCRIPTION
 
-**smacs** is a lightweight terminal text editor with Emacs-style keybindings,
-written in Strada. It supports multiple buffers, incremental search, regex
-replace, syntax highlighting, undo, and a minibuffer command interface with
-tab-completion.
+**smacs** is a lightweight Emacs-like text editor written in Strada. It
+provides familiar Emacs key bindings, multiple buffers, split windows,
+incremental search, syntax highlighting, and a hex editing mode.
 
-## OPTIONS
+# OPTIONS
 
 *file*
-:   One or more files to open. The first file replaces the default scratch
-    buffer; additional files open in new buffers.
+: Open one or more files. If no files are given, smacs starts with a
+  scratch buffer.
 
-**--syntax** *file.vim*
-:   Load a vim syntax highlighting file before opening files.
+`--syntax` *file.vim*
+: Load a vim syntax file for additional syntax highlighting.
 
-## KEY BINDINGS
+# CONFIGURATION
 
-### Movement
+smacs reads settings from `/etc/smacsrc` and `~/.smacsrc` on startup.
+The format is `key = value`, one per line. Lines beginning with `#` are
+comments. Tilde (`~`) is expanded to `$HOME` in paths.
 
-**C-f**, **Right**
-:   Move forward one character.
+## General Options
 
-**C-b**, **Left**
-:   Move backward one character.
+`line-numbers` = `on` | `off`
+: Show line numbers in the gutter. Default: `off`.
 
-**C-n**, **Down**
-:   Move to next line.
+`tab-width` = *N*
+: Number of spaces per tab stop (1-16). Default: `4`.
 
-**C-p**, **Up**
-:   Move to previous line.
+`indent-tabs-mode` = `on` | `off`
+: Use real tab characters instead of spaces. Default: `off`.
 
-**C-a**, **Home**
-:   Move to beginning of line.
+`fill-column` = *N*
+: Column width for `M-q` fill-paragraph (1-1000). Default: `70`.
 
-**C-e**, **End**
-:   Move to end of line.
+`undo-max` = *N*
+: Maximum undo entries per buffer. Default: `100`.
 
-**C-v**, **PgDn**
-:   Page down.
+`which-function-mode` = `on` | `off`
+: Show current function name in the status bar. Default: `on`.
 
-**M-v**, **PgUp**
-:   Page up.
+## Syntax Highlighting Options
 
-**M-f**
-:   Move forward one word.
+`syntax` = *language*
+: Override the auto-detected syntax highlighting language.
 
-**M-b**
-:   Move backward one word.
+`vim-syntax` = *path*
+: Load a single vim syntax file.
 
-**M-<**
-:   Move to beginning of buffer.
+`syntax-dir` = *path*
+: Load all vim syntax files from a directory. Supports both flat
+  directories of `.vim` files and the standard vim plugin layout with
+  `ftdetect/` and `syntax/` subdirectories. When `ftdetect/` files are
+  present, file extension mappings are automatically registered from
+  autocmd lines (e.g., `au BufRead,BufNewFile *.rs setfiletype rust`).
 
-**M->**
-:   Move to end of buffer.
+`syntax-ext` = *ext*:*language*
+: Map a file extension to a syntax language name. Multiple entries can
+  map different extensions to the same language. Example:
 
-**M-g**
-:   Go to line number (prompts for input).
+    syntax-ext = rs:rust
+    syntax-ext = ts:typescript
+    syntax-ext = tsx:typescript
 
-### Editing
+# KEY BINDINGS
 
-**C-d**, **Del**
-:   Delete character forward.
+## Movement
 
-**Backspace**
-:   Delete character backward.
+`C-f`, `RIGHT`
+: Forward character.
 
-**M-Backspace**
-:   Delete word backward.
+`C-b`, `LEFT`
+: Backward character.
 
-**M-d**
-:   Delete word forward.
+`C-n`, `DOWN`
+: Next line.
 
-**C-k**
-:   Kill (cut) to end of line. Killed text is saved to the kill ring.
+`C-p`, `UP`
+: Previous line.
 
-**C-y**
-:   Yank (paste) from kill ring.
+`C-a`, `HOME`
+: Beginning of line.
 
-**C-w**
-:   Kill (cut) region between mark and cursor.
+`C-e`, `END`
+: End of line.
 
-**M-w**
-:   Copy region between mark and cursor.
+`M-f`
+: Forward word.
 
-**C-_**
-:   Undo the last editing operation. Up to 100 undo states are saved per
-    buffer (configurable via *undo-max*).
+`M-b`
+: Backward word.
 
-**C-o**
-:   Open a new line below the cursor.
+`C-v`, `PGDN`
+: Page down.
 
-**C-Space**
-:   Set the mark at the current cursor position.
+`M-v`, `PGUP`
+: Page up.
 
-### Search and Replace
+`M-<`
+: Beginning of buffer.
 
-**C-s**
-:   Incremental search forward. Type the search string; matches highlight
-    as you type. Press **C-s** again to find the next match. Press **RET**
-    to stop at the current match, or **C-g** to cancel.
+`M->`
+: End of buffer.
 
-**C-r**
-:   Reverse incremental search.
+`M-g`
+: Goto line number.
 
-**M-%**
-:   Query replace. Prompts for search and replacement strings, then
-    interactively asks for confirmation at each match.
+## Editing
 
-### Files and Buffers
+`C-d`, `DEL`
+: Delete character.
 
-**C-x C-f**
-:   Find file. Prompts for a file path with tab-completion for files and
-    directories. If the file is already open, switches to its buffer.
+`Backspace`
+: Backward delete character.
 
-**C-x C-s**
-:   Save the current buffer to its file. If the buffer has no file,
-    prompts for a path.
+`C-k`
+: Kill to end of line.
 
-**C-x b**
-:   Switch buffer. Prompts for a buffer name with tab-completion. If the
-    name does not match an existing buffer, a new buffer is created.
+`C-y`
+: Yank (paste) from kill ring.
 
-**C-x k**
-:   Kill (close) the current buffer.
+`C-w`
+: Kill region.
 
-**C-x o**
-:   Switch to the next buffer.
+`M-w`
+: Copy region.
 
-**C-x C-b**
-:   List all open buffers in the message bar.
+`C-SPC`
+: Set mark.
 
-**C-x 2**
-:   Create a new scratch buffer.
+`M-d`
+: Kill word forward.
 
-**C-x h**
-:   Select all (mark whole buffer).
+`M-Backspace`
+: Kill word backward.
 
-**C-x C-c**
-:   Quit smacs. Prompts for confirmation if there are unsaved changes.
+`M-q`
+: Fill paragraph to fill-column width.
 
-### Other
+`C-_`, `C-/`
+: Undo.
 
-**M-x**
-:   Execute a named command. Supports tab-completion. Press **TAB** with
-    an empty input to see all available commands.
+## Search & Replace
 
-**C-g**
-:   Cancel the current operation.
+`C-s`
+: Incremental search forward. Press `C-s` again with an empty query to
+  recall the last search. `UP`, `DOWN`, `RET`, and `ESC` exit the
+  search. `C-g` cancels and restores the cursor position.
 
-**ESC ESC**
-:   Cancel (same as C-g).
+`C-r`
+: Incremental search backward.
 
-**C-l**
-:   Redraw the screen.
+`M-%`
+: Query replace.
 
-## META KEY
+## Files & Buffers
 
-The Meta (Alt) key can be pressed in two ways:
+`C-x C-s`
+: Save file.
 
-1. Hold Alt and press the key simultaneously (e.g., **Alt+x**).
-2. Press **Escape**, release it, then press the key. smacs waits
-   indefinitely after Escape for the follow-up key.
+`C-x C-f`
+: Find (open) file. Starts in the directory of the current file.
 
-## COMMANDS
+`C-x C-w`
+: Write file (save as).
 
-Commands are invoked via **M-x** followed by the command name:
+`C-x b`
+: Switch buffer. Suggests the last viewed buffer as default.
 
-**replace-regexp**
-:   Regex search and replace from cursor to end of buffer.
+`C-x k`
+: Kill buffer.
 
-**query-replace**, **replace-string**
-:   Interactive search and replace with confirmation at each match.
+`C-x RIGHT`
+: Next buffer.
 
-**refresh-buffer**, **revert-buffer**
-:   Reload the current file from disk.
+`C-x LEFT`
+: Previous buffer.
 
-**goto-line**
-:   Jump to a specific line number.
+`C-x C-c`
+: Quit.
 
-**find-file**
-:   Open a file (same as C-x C-f).
+## Windows
 
-**switch-buffer**
-:   Switch to a buffer (same as C-x b).
+`C-x 2`
+: Split window horizontally.
 
-**list-buffers**
-:   List all open buffers.
+`C-x 3`
+: Split window vertically.
 
-**kill-buffer**
-:   Kill the current buffer (same as C-x k).
+`C-x 1`
+: Delete other windows.
 
-**line-numbers-mode**
-:   Toggle line number display in the left gutter.
+`C-x o`
+: Switch to other window.
 
-**which-function-mode**
-:   Toggle display of the enclosing function name in the status bar.
-    Enabled by default. Supports C, Strada, Perl, Python, JavaScript,
-    and Shell function definitions.
+## Other
 
-**indent-tabs-mode**
-:   Toggle between inserting real tab characters and spaces when pressing
-    Tab. Default is spaces.
+`M-x`
+: Execute a named command.
 
-**set-tab-width**
-:   Set the number of spaces per tab stop (1-16). Default is 4. Affects
-    Tab key insertion (in spaces mode), *tabify*, and *untabify*.
+`C-g`
+: Cancel current operation.
 
-**tabify**
-:   Convert leading spaces to tab characters in the entire buffer, using
-    the current tab width.
+`C-l`
+: Redraw screen.
 
-**untabify**
-:   Convert all tab characters to spaces in the entire buffer, using the
-    current tab width.
+`C-z`
+: Suspend smacs (resume with `fg`).
 
-**set-syntax**
-:   Manually set the syntax highlighting language.
+`C-h b`
+: Show key bindings help.
 
-**load-vim-syntax**
-:   Load a vim syntax file for additional language support.
+`C-h k`
+: Describe key.
 
-**what-cursor-position**
-:   Display the character code and position at the cursor.
+`C-h l`
+: Show license and about information.
 
-**text-mode**, **strada-mode**, **c-mode**, **perl-mode**, **python-mode**, **javascript-mode**, **html-mode**, **css-mode**, **shell-mode**, **makefile-mode**, **markdown-mode**
-:   Switch the current buffer's major mode, which controls syntax
-    highlighting.
+## M-x Commands
 
-## MAJOR MODES
+`goto-line`, `replace-regexp`, `replace-string`, `set-tab-width`,
+`tabify`, `untabify`, `indent-tabs-mode`, `fill-paragraph`,
+`set-fill-column`, `count-words`, `count-lines`, `revert-buffer`,
+`set-syntax`, `load-vim-syntax`, `what-cursor-position`,
+`line-numbers-mode`, `which-function-mode`, `hex-mode`
 
-Major modes are set automatically based on file extension:
+# HEX MODE
 
-| Extension             | Mode       |
-|-----------------------|------------|
-| .c, .h                | C          |
-| .pl, .pm, .t          | Perl       |
-| .strada, .st          | Strada     |
-| .py                   | Python     |
-| .js                   | JavaScript |
-| .html, .htm           | HTML       |
-| .css                  | CSS        |
-| .sh, .bash            | Shell      |
-| Makefile, GNUmakefile | Makefile   |
-| .md, .markdown        | Markdown   |
+Toggle hex mode with `M-x hex-mode`. Displays file contents as
+hexadecimal and ASCII side by side. Press `TAB` to switch between hex
+and ASCII editing areas. `M-g` prompts for a hex offset to jump to.
+`C-x C-s` saves the raw binary data back to the file.
 
-The current mode is shown in the status bar in parentheses.
+# FILES
 
-## FILES
+`/etc/smacsrc`
+: System-wide configuration file.
 
-**/etc/smacsrc**
-:   System-wide configuration file. Read first.
+`~/.smacsrc`
+: Per-user configuration file.
 
-**~/.smacsrc**
-:   User configuration file. Read second; overrides system settings.
+# AUTHOR
 
-### Configuration Format
+Michael J. Flickinger <mjflick@gnu.org>
 
-One *key* **=** *value* per line. Lines starting with **#** are comments.
+# LICENSE
 
-    # Enable line numbers
-    line-numbers = on
-
-    # Default syntax
-    syntax = strada
-
-    # Max undo entries per buffer (default: 100)
-    undo-max = 200
-
-    # Tab settings (default: 4 spaces)
-    tab-width = 4
-    indent-tabs-mode = off
-
-    # Function name in status bar (default: on)
-    which-function-mode = on
-
-    # Auto-load vim syntax
-    vim-syntax = /path/to/lang.vim
-
-## STATUS BAR
-
-The status bar at the bottom shows:
-
-    -- filename  funcname()        (Mode) L42/500 C10
-
-- **\*\*** indicates unsaved changes; **--** indicates a clean buffer.
-- **funcname()** shows the enclosing function (when which-function-mode is on).
-- **(Mode)** shows the current major mode.
-- **L42/500** shows the current line and total line count.
-- **C10** shows the current column.
-
-## AUTHOR
-
-Written in Strada.
-
-## SEE ALSO
-
-**emacs**(1), **vi**(1), **nano**(1), **strada**(1)
+GNU General Public License v2 or later.
+See `COPYING` for the full license text.

@@ -1,233 +1,242 @@
 # smacs
 
-A lightweight Emacs-like text editor written in [Strada](https://github.com/strada-lang/strada).
-
-## Features
-
-- Multiple buffers with switching and tab-completion
-- **Window splitting** (C-x 2 to split, C-x o to switch, C-x 1 to unsplit)
-- Incremental search (C-s) and query replace (M-%)
-- Regex replace (M-x replace-regexp)
-- Syntax highlighting for C, Perl, Strada, Python, JavaScript, HTML, CSS, Shell, Makefile, and Markdown
-- Vim syntax file loading for additional languages
-- Major modes (text-mode, strada-mode, c-mode, etc.)
-- Line numbers mode
-- Undo (C-\_)
-- Kill/yank (cut/paste) with kill ring
-- Mark and region support
-- Bracket matching with highlighting
-- File finder with tab-completion (C-x C-f)
-- M-x command interface with tab-completion
-- Config file support (~/.smacsrc)
-- **UTF-8 support** (multi-byte characters, CJK double-width, emoji)
-- **Built-in help system** (C-h b for keybindings, C-h k for describe-key)
-- Word and line counting (M-x count-words)
-- No C code — pure Strada using `core::` runtime functions
+A lightweight Emacs-like text editor written in [Strada](https://github.com/strada-lang/strada-lang).
 
 ## Building
 
-Requires a working Strada compiler (`strada` in PATH).
+Requires a working Strada compiler.
 
-```sh
-make          # Build smacs
-make debug    # Build with debug symbols
-make clean    # Remove build artifacts
+```bash
+make            # Build smacs
+make install    # Install to /usr/local (or PREFIX=/path make install)
 ```
-
-Override the compiler with `make STRADA=/path/to/strada`.
 
 ## Usage
 
-```sh
-smacs                          # Open with scratch buffer
-smacs file.txt                 # Open a file
-smacs file1.c file2.c          # Open multiple files
-smacs --syntax lang.vim file   # Load vim syntax file
+```bash
+smacs                           # Open with scratch buffer
+smacs file.txt                  # Open a file
+smacs file1.txt file2.txt       # Open multiple files
+smacs --syntax lang.vim file.c  # Load a vim syntax file
 ```
+
+## Configuration
+
+smacs reads configuration from `/etc/smacsrc` and `~/.smacsrc`. The format
+is `key = value`, one per line. Lines starting with `#` are comments.
+
+### Options
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `line-numbers` | `on`/`off` | `off` | Show line numbers |
+| `tab-width` | 1-16 | 4 | Spaces per tab stop |
+| `indent-tabs-mode` | `on`/`off` | `off` | Use real tabs instead of spaces |
+| `fill-column` | 1-1000 | 70 | Column width for M-q fill-paragraph |
+| `undo-max` | integer | 100 | Maximum undo entries per buffer |
+| `which-function-mode` | `on`/`off` | `on` | Show current function name in status bar |
+| `syntax` | language name | auto | Override syntax highlighting language |
+| `vim-syntax` | path | - | Load a single vim syntax file |
+| `syntax-dir` | path | - | Load all vim syntax files from a directory |
+| `syntax-ext` | ext:lang | - | Map a file extension to a language |
+
+### Example ~/.smacsrc
+
+```
+line-numbers = on
+tab-width = 4
+fill-column = 80
+indent-tabs-mode = off
+
+# Load vim syntax files from a directory
+syntax-dir = ~/vim-syntax
+
+# Manual extension-to-language mappings
+syntax-ext = rs:rust
+syntax-ext = ts:typescript
+```
+
+## Syntax Highlighting
+
+smacs has built-in syntax highlighting for C, Strada, Perl, Python,
+JavaScript, HTML, CSS, Shell, and Markdown.
+
+Additional languages can be added by loading vim syntax files.
+
+### Loading Vim Syntax Files
+
+There are three ways to load vim syntax files:
+
+**1. syntax-dir (recommended)**
+
+Point `syntax-dir` at a directory containing vim syntax files. smacs supports
+both flat directories of `.vim` files and the standard vim plugin layout:
+
+```
+my-syntax/
+  ftdetect/
+    rust.vim        # au BufRead,BufNewFile *.rs setfiletype rust
+  syntax/
+    rust.vim        # syn keyword, syn match, syn region, hi link ...
+```
+
+When a `ftdetect/` subdirectory is present, smacs parses the autocmd lines to
+learn which file extensions map to which language. This is how smacs knows that
+`.rs` files should use the `rust` syntax definition.
+
+When there is no `ftdetect/` subdirectory, smacs loads `.vim` files directly
+from the directory and infers the language name from the filename
+(e.g., `python.vim` registers as language `python`).
+
+```
+# In ~/.smacsrc
+syntax-dir = ~/vim-syntax
+```
+
+**2. syntax-ext (manual extension mapping)**
+
+If your syntax files don't include `ftdetect/` data, or you want to add extra
+extensions for an existing language, use `syntax-ext`:
+
+```
+# In ~/.smacsrc
+syntax-ext = rs:rust
+syntax-ext = jsx:javascript
+syntax-ext = tsx:typescript
+syntax-ext = ts:typescript
+```
+
+Multiple extensions can map to the same language with separate lines.
+
+**3. vim-syntax (single file)**
+
+Load a single vim syntax file by path:
+
+```
+# In ~/.smacsrc
+vim-syntax = ~/vim-syntax/rust.vim
+```
+
+Or from the command line:
+
+```bash
+smacs --syntax rust.vim main.rs
+```
+
+Or at runtime with `M-x load-vim-syntax`.
+
+### Supported Vim Syntax Constructs
+
+smacs parses a subset of vim syntax files:
+
+- `syn keyword GroupName word1 word2 ...`
+- `syn match GroupName /pattern/`
+- `syn region GroupName start=/pat/ end=/pat/`
+- `hi def link GroupName HighlightGroup`
+- `au BufRead,BufNewFile *.ext setfiletype lang` (in ftdetect files)
+
+Tilde (`~`) is expanded to `$HOME` in all paths.
 
 ## Key Bindings
 
 ### Movement
 
-| Key        | Action                 |
-|------------|------------------------|
-| C-f / Right | Forward one character |
-| C-b / Left  | Backward one character |
-| C-n / Down  | Next line             |
-| C-p / Up    | Previous line         |
-| C-a / Home  | Beginning of line     |
-| C-e / End   | End of line           |
-| C-v / PgDn  | Page down             |
-| M-v / PgUp  | Page up               |
-| M-f         | Forward one word      |
-| M-b         | Backward one word     |
-| M-<         | Beginning of buffer   |
-| M->         | End of buffer         |
-| M-g         | Go to line number     |
+| Key | Action |
+|-----|--------|
+| `C-f` / `RIGHT` | Forward char |
+| `C-b` / `LEFT` | Backward char |
+| `C-n` / `DOWN` | Next line |
+| `C-p` / `UP` | Previous line |
+| `C-a` / `HOME` | Beginning of line |
+| `C-e` / `END` | End of line |
+| `M-f` | Forward word |
+| `M-b` | Backward word |
+| `C-v` / `PGDN` | Page down |
+| `M-v` / `PGUP` | Page up |
+| `M-<` | Beginning of buffer |
+| `M->` | End of buffer |
+| `M-g` | Goto line |
 
 ### Editing
 
-| Key           | Action                    |
-|---------------|---------------------------|
-| C-d / Del     | Delete character forward  |
-| Backspace     | Delete character backward |
-| M-Backspace   | Delete word backward      |
-| M-d           | Delete word forward       |
-| C-k           | Kill to end of line       |
-| C-y           | Yank (paste)              |
-| C-w           | Kill region               |
-| M-w           | Copy region               |
-| C-\_          | Undo                      |
-| C-o           | Other window (split) / Open line (single) |
-| C-Space       | Set mark                  |
-| Tab           | Insert spaces (or tab, see indent-tabs-mode) |
+| Key | Action |
+|-----|--------|
+| `C-d` / `DEL` | Delete char |
+| `Backspace` | Backward delete char |
+| `C-k` | Kill line |
+| `C-y` | Yank (paste) |
+| `C-w` | Kill region |
+| `M-w` | Copy region |
+| `C-SPC` | Set mark |
+| `M-d` | Kill word forward |
+| `M-Backspace` | Kill word backward |
+| `M-q` | Fill paragraph |
+| `C-_` / `C-/` | Undo |
+| `TAB` | Indent / insert tab |
 
-### Search and Replace
+### Search & Replace
 
-| Key           | Action                    |
-|---------------|---------------------------|
-| C-s           | Incremental search        |
-| C-r           | Reverse incremental search |
-| M-%           | Query replace             |
+| Key | Action |
+|-----|--------|
+| `C-s` | Incremental search forward |
+| `C-r` | Incremental search backward |
+| `M-%` | Query replace |
 
-### Files and Buffers
+In incremental search, `C-s` with an empty query recalls the last search.
+`UP`, `DOWN`, `RET`, and `ESC` all exit the search. `C-g` cancels and
+restores the original cursor position.
 
-| Key           | Action                    |
-|---------------|---------------------------|
-| C-x C-f       | Find file (with completion) |
-| C-x C-s       | Save file                 |
-| C-x C-w       | Write file (save as)      |
-| C-x b         | Switch buffer (with completion) |
-| C-x k         | Kill buffer               |
-| C-x C-b       | List buffers              |
-| C-x C-c       | Quit                      |
+### Files & Buffers
+
+| Key | Action |
+|-----|--------|
+| `C-x C-s` | Save file |
+| `C-x C-f` | Find (open) file |
+| `C-x C-w` | Write file (save as) |
+| `C-x b` | Switch buffer |
+| `C-x k` | Kill buffer |
+| `C-x RIGHT` | Next buffer |
+| `C-x LEFT` | Previous buffer |
+| `C-x C-c` | Quit |
 
 ### Windows
 
-| Key           | Action                    |
-|---------------|---------------------------|
-| C-x 2         | Split window horizontally |
-| C-x 3         | Split window vertically   |
-| C-x o         | Switch to other window    |
-| C-x 1         | Delete other windows      |
-
-### Help
-
-| Key           | Action                    |
-|---------------|---------------------------|
-| C-h b         | Show all key bindings     |
-| C-h k         | Describe a key            |
+| Key | Action |
+|-----|--------|
+| `C-x 2` | Split window horizontally |
+| `C-x 3` | Split window vertically |
+| `C-x 1` | Delete other windows |
+| `C-x o` | Other window |
+| `C-o` | Other window (when split) / Open line |
 
 ### Other
 
-| Key           | Action                    |
-|---------------|---------------------------|
-| M-x           | Execute command           |
-| C-g / ESC ESC | Cancel                    |
-| C-l           | Redraw screen             |
-| C-x h         | Select all                |
+| Key | Action |
+|-----|--------|
+| `M-x` | Execute command |
+| `C-g` | Cancel / keyboard quit |
+| `C-l` | Redraw screen |
+| `C-z` | Suspend (return with `fg`) |
+| `C-h b` | Show key bindings |
+| `C-h k` | Describe key |
+| `C-h l` | License / about |
 
-**Note:** ESC can be pressed slowly before the next key. smacs waits
-indefinitely for the follow-up key after ESC, so M-x can be typed as
-ESC then x at any speed.
+### M-x Commands
 
-## M-x Commands
+`goto-line`, `replace-regexp`, `replace-string`, `set-tab-width`, `tabify`,
+`untabify`, `indent-tabs-mode`, `fill-paragraph`, `set-fill-column`,
+`count-words`, `count-lines`, `revert-buffer`, `set-syntax`,
+`load-vim-syntax`, `what-cursor-position`, `line-numbers-mode`,
+`which-function-mode`, `hex-mode`
 
-| Command              | Action                              |
-|----------------------|-------------------------------------|
-| replace-regexp       | Regex search and replace            |
-| query-replace        | Interactive search and replace      |
-| replace-string       | Same as query-replace               |
-| refresh-buffer       | Reload file from disk               |
-| revert-buffer        | Same as refresh-buffer              |
-| goto-line            | Jump to a line number               |
-| find-file            | Open a file                         |
-| switch-buffer        | Switch to a buffer                  |
-| list-buffers         | Show all buffers in message bar     |
-| kill-buffer          | Kill the current buffer             |
-| count-words          | Count lines, words, and characters  |
-| count-lines          | Count lines in buffer               |
-| line-numbers-mode    | Toggle line numbers                 |
-| which-function-mode  | Toggle function name in status bar  |
-| indent-tabs-mode     | Toggle between tabs and spaces      |
-| set-tab-width        | Set number of spaces per tab (1-16) |
-| tabify               | Convert leading spaces to tabs      |
-| untabify             | Convert all tabs to spaces          |
-| set-syntax           | Set syntax highlighting language    |
-| load-vim-syntax      | Load a vim syntax file              |
-| what-cursor-position | Show character info at cursor       |
-| text-mode            | Switch to Text mode (no highlight)  |
-| strada-mode          | Switch to Strada mode               |
-| c-mode               | Switch to C mode                    |
-| perl-mode            | Switch to Perl mode                 |
-| python-mode          | Switch to Python mode               |
-| javascript-mode      | Switch to JavaScript mode           |
-| html-mode            | Switch to HTML mode                 |
-| css-mode             | Switch to CSS mode                  |
-| shell-mode           | Switch to Shell mode                |
-| makefile-mode        | Switch to Makefile mode             |
-| markdown-mode        | Switch to Markdown mode             |
+### Hex Mode
 
-## Major Modes
-
-Major modes are set automatically when opening a file based on its extension:
-
-| Extension                | Mode       |
-|--------------------------|------------|
-| .c, .h                   | C          |
-| .pl, .pm, .t             | Perl       |
-| .strada, .st             | Strada     |
-| .py                      | Python     |
-| .js                      | JavaScript |
-| .html, .htm              | HTML       |
-| .css                     | CSS        |
-| .sh, .bash               | Shell      |
-| Makefile, GNUmakefile    | Makefile   |
-| .md, .markdown           | Markdown   |
-
-Modes can also be set manually with `M-x <name>-mode`.
-
-The current mode is displayed in the status bar: `(Strada)`, `(C)`, etc.
-
-## UTF-8 Support
-
-smacs handles multi-byte UTF-8 characters correctly:
-
-- Cursor movement steps by codepoint, not byte
-- Insert, delete, and backspace operate on whole characters
-- Display width accounts for double-width CJK characters and emoji
-- Word movement treats accented and non-ASCII letters as word characters
-- Status bar column display shows the display column, not byte offset
-- Syntax highlighting iterates by character boundaries
-
-## Configuration
-
-smacs reads configuration from `/etc/smacsrc` (system) and `~/.smacsrc` (user).
-The user config overrides system defaults.
-
-Format: one `key = value` per line. Lines starting with `#` are comments.
-
-```
-# Enable line numbers by default
-line-numbers = on
-
-# Set default syntax highlighting
-syntax = strada
-
-# Increase undo history (default 100)
-undo-max = 200
-
-# Tab settings
-tab-width = 4
-indent-tabs-mode = off    # off=spaces (default), on=real tabs
-
-# Show function name in status bar (default: on)
-which-function-mode = on
-
-# Auto-load a vim syntax file
-vim-syntax = /path/to/lang.vim
-```
+Toggle with `M-x hex-mode`. Displays file contents as hex and ASCII side by
+side. Press `TAB` to switch between hex and ASCII editing areas.
 
 ## License
 
-Same license as the Strada project.
+smacs is free software licensed under the
+[GNU General Public License v2](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+
+Copyright (C) 2026 Michael J. Flickinger <mjflick@gnu.org>
