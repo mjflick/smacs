@@ -1,0 +1,123 @@
+# Java completion definitions for smacs
+
+# Keywords
+keyword: abstract assert break case catch class const continue default do
+keyword: else enum extends final finally for goto if implements import
+keyword: instanceof interface native new package private protected public
+keyword: return static strictfp super switch synchronized this throw throws
+keyword: transient try var void volatile while yield record sealed permits
+
+# Primitive types
+type: boolean byte char double float int long short void
+
+# Wrapper types
+type: String Integer Long Double Float Boolean Character Byte Short
+type: Object Class Void Number BigInteger BigDecimal
+
+# Collections
+type: List ArrayList LinkedList Vector Stack
+type: Map HashMap LinkedHashMap TreeMap ConcurrentHashMap Hashtable
+type: Set HashSet LinkedHashSet TreeSet EnumSet
+type: Queue Deque ArrayDeque PriorityQueue LinkedList
+type: Collection Collections Iterator ListIterator Iterable
+type: Enumeration
+
+# Streams and Optional
+type: Stream IntStream LongStream DoubleStream
+type: Optional OptionalInt OptionalLong OptionalDouble
+type: Collector Collectors
+
+# Concurrency
+type: Thread Runnable Callable Future CompletableFuture
+type: Executor ExecutorService Executors ThreadPoolExecutor
+type: Lock ReentrantLock ReadWriteLock Condition
+type: AtomicInteger AtomicLong AtomicBoolean AtomicReference
+type: CountDownLatch CyclicBarrier Semaphore
+type: ConcurrentLinkedQueue ConcurrentLinkedDeque BlockingQueue
+
+# I/O
+type: InputStream OutputStream Reader Writer
+type: FileInputStream FileOutputStream FileReader FileWriter
+type: BufferedReader BufferedWriter BufferedInputStream BufferedOutputStream
+type: PrintWriter PrintStream Scanner
+type: Path Paths Files File
+type: ByteArrayInputStream ByteArrayOutputStream StringReader StringWriter
+
+# Functional interfaces
+type: Comparable Comparator
+type: Function BiFunction Consumer BiConsumer Supplier
+type: Predicate BiPredicate UnaryOperator BinaryOperator
+
+# String
+type: StringBuilder StringBuffer StringJoiner
+type: Pattern Matcher
+
+# Exceptions
+type: Exception RuntimeException IOException
+type: NullPointerException IllegalArgumentException IllegalStateException
+type: IndexOutOfBoundsException ArrayIndexOutOfBoundsException
+type: ClassCastException UnsupportedOperationException
+type: ClassNotFoundException NoSuchMethodException
+type: InterruptedException NumberFormatException
+type: FileNotFoundException SecurityException
+type: ConcurrentModificationException StackOverflowError OutOfMemoryError
+
+# Enum / Record
+type: Enum Record
+
+# Constants
+constant: null true false
+
+# Common annotations
+annotation: @Override @Deprecated @SuppressWarnings @FunctionalInterface
+annotation: @SafeVarargs @Retention @Target @Documented @Inherited
+annotation: @Test @Before @After @BeforeEach @AfterEach
+annotation: @Autowired @Component @Service @Repository @Controller
+annotation: @RequestMapping @GetMapping @PostMapping @PathVariable @RequestBody
+
+# System methods
+builtin: System.out.println System.out.print System.out.printf
+builtin: System.err.println System.err.print
+builtin: System.exit System.currentTimeMillis System.nanoTime
+builtin: System.getenv System.getProperty System.arraycopy System.gc
+
+# Math methods
+math: Math.abs Math.max Math.min Math.pow Math.sqrt Math.cbrt
+math: Math.ceil Math.floor Math.round Math.random
+math: Math.sin Math.cos Math.tan Math.asin Math.acos Math.atan Math.atan2
+math: Math.log Math.log10 Math.exp Math.PI Math.E
+math: Math.toRadians Math.toDegrees Math.signum
+
+# Arrays utility
+arrays: Arrays.sort Arrays.binarySearch Arrays.fill Arrays.copyOf Arrays.copyOfRange
+arrays: Arrays.equals Arrays.deepEquals Arrays.asList Arrays.stream
+arrays: Arrays.toString Arrays.deepToString Arrays.hashCode
+
+# Collections utility
+collections: Collections.sort Collections.reverse Collections.shuffle
+collections: Collections.min Collections.max Collections.frequency
+collections: Collections.unmodifiableList Collections.unmodifiableMap Collections.unmodifiableSet
+collections: Collections.synchronizedList Collections.synchronizedMap
+collections: Collections.singletonList Collections.emptyList Collections.emptyMap Collections.emptySet
+
+# Objects utility
+objects: Objects.requireNonNull Objects.equals Objects.hashCode Objects.toString
+objects: Objects.isNull Objects.nonNull Objects.compare
+
+# String methods
+string: length charAt indexOf lastIndexOf substring contains
+string: startsWith endsWith equals equalsIgnoreCase compareTo
+string: trim strip toLowerCase toUpperCase replace replaceAll replaceFirst
+string: split join format valueOf toCharArray matches isEmpty isBlank
+string: repeat lines chars codePoints intern
+
+# Collectors
+collector: Collectors.toList Collectors.toSet Collectors.toMap
+collector: Collectors.joining Collectors.groupingBy Collectors.partitioningBy
+collector: Collectors.counting Collectors.summarizingInt Collectors.averagingInt
+
+# Stream methods
+stream: filter map flatMap distinct sorted peek limit skip
+stream: forEach forEachOrdered toArray reduce collect count
+stream: anyMatch allMatch noneMatch findFirst findAny
+stream: of iterate generate empty concat

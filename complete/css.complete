@@ -1,0 +1,142 @@
+# CSS completion definitions for smacs
+
+# At-rules
+keyword: @media @import @font-face @keyframes @charset @namespace @supports
+keyword: @page @layer @container @property @scope @starting-style @counter-style
+
+# Properties - layout
+property: display position top right bottom left float clear z-index
+property: overflow visibility opacity width height min-width max-width
+property: min-height max-height
+
+# Properties - margin and padding
+property: margin margin-top margin-right margin-bottom margin-left
+property: padding padding-top padding-right padding-bottom padding-left
+
+# Properties - border
+property: border border-width border-style border-color border-radius
+property: border-top border-right border-bottom border-left
+property: outline box-shadow box-sizing
+
+# Properties - background
+property: background background-color background-image background-position
+property: background-repeat background-size background-attachment color
+
+# Properties - font and text
+property: font font-family font-size font-weight font-style font-variant
+property: line-height letter-spacing word-spacing text-align text-decoration
+property: text-transform text-indent text-shadow text-overflow white-space
+property: word-break word-wrap overflow-wrap vertical-align
+
+# Properties - list
+property: list-style list-style-type list-style-position list-style-image
+
+# Properties - misc
+property: cursor pointer-events user-select resize content counter-reset
+property: counter-increment quotes clip-path filter backdrop-filter
+property: mix-blend-mode isolation object-fit object-position aspect-ratio
+property: container-type container-name
+
+# Properties - transition and animation
+property: transition transition-property transition-duration
+property: transition-timing-function transition-delay
+property: animation animation-name animation-duration animation-timing-function
+property: animation-delay animation-iteration-count animation-direction
+property: animation-fill-mode animation-play-state
+property: transform transform-origin perspective perspective-origin
+property: backface-visibility
+
+# Properties - flexbox
+property: flex flex-direction flex-wrap flex-flow flex-grow flex-shrink
+property: flex-basis justify-content align-items align-self align-content
+property: order gap row-gap column-gap
+
+# Properties - grid
+property: grid grid-template grid-template-columns grid-template-rows
+property: grid-template-areas grid-column grid-row grid-area
+property: grid-auto-columns grid-auto-rows grid-auto-flow
+property: place-items place-content place-self
+property: columns column-count column-width column-rule column-span column-fill
+
+# Properties - scroll
+property: scroll-behavior scroll-snap-type scroll-snap-align
+property: scroll-margin scroll-padding
+
+# Properties - performance
+property: will-change contain accent-color appearance caret-color color-scheme
+
+# Values - display
+value: none block inline inline-block flex grid inline-flex inline-grid
+value: table contents flow-root
+
+# Values - position
+value: absolute relative fixed sticky static
+
+# Values - overflow
+value: hidden visible scroll clip auto
+
+# Values - general
+value: inherit initial unset revert transparent currentColor normal
+
+# Values - font
+value: bold italic underline overline line-through
+value: capitalize uppercase lowercase
+
+# Values - alignment
+value: center left right justify top middle bottom baseline
+
+# Values - whitespace
+value: nowrap pre pre-wrap pre-line break-word break-all keep-all
+
+# Values - cursor
+value: pointer default not-allowed grab grabbing crosshair text move
+value: wait help progress zoom-in zoom-out
+
+# Values - flexbox
+value: row column wrap row-reverse column-reverse
+value: space-between space-around space-evenly stretch start end
+value: flex-start flex-end
+
+# Values - animation
+value: ease ease-in ease-out ease-in-out linear step-start step-end
+value: forwards backwards both alternate reverse alternate-reverse
+value: infinite running paused
+
+# Values - box
+value: border-box content-box padding-box
+
+# Values - object-fit
+value: cover contain fill scale-down
+
+# Pseudo-classes
+pseudo: :hover :active :focus :focus-visible :focus-within :visited :link
+pseudo: :first-child :last-child :nth-child :nth-last-child :nth-of-type
+pseudo: :first-of-type :last-of-type :only-child :only-of-type :empty
+pseudo: :not :is :where :has :root :target :checked :disabled :enabled
+pseudo: :required :optional :valid :invalid :in-range :out-of-range
+pseudo: :read-only :read-write :placeholder-shown :default :indeterminate
+pseudo: :defined :any-link :local-link :lang :dir
+
+# Pseudo-elements
+pseudo: ::before ::after ::first-line ::first-letter ::placeholder
+pseudo: ::selection ::marker ::backdrop ::file-selector-button ::cue
+pseudo: ::part ::slotted
+
+# Functions
+builtin: calc min max clamp var env url attr counter counters
+builtin: rgb rgba hsl hsla hwb lab lch oklch oklab color color-mix light-dark
+builtin: linear-gradient radial-gradient conic-gradient
+builtin: repeating-linear-gradient repeating-radial-gradient repeating-conic-gradient
+builtin: image-set cross-fade element paint fit-content minmax repeat
+builtin: auto-fill auto-fit translate rotate scale skew matrix perspective
+builtin: translateX translateY translateZ translate3d
+builtin: rotateX rotateY rotateZ rotate3d scaleX scaleY scaleZ scale3d
+builtin: cubic-bezier steps blur brightness contrast drop-shadow grayscale
+builtin: hue-rotate invert saturate sepia opacity
+
+# Units
+unit: px em rem % vw vh vmin vmax ch ex fr
+unit: pt cm mm in pc
+unit: deg rad grad turn
+unit: s ms Hz kHz
+unit: dpi dpcm dppx

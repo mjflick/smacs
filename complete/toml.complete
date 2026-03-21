@@ -1,0 +1,27 @@
+# TOML completion definitions for smacs
+
+# Constants
+keyword: true false
+
+# Types (conceptual)
+type: string integer float boolean datetime date time array table
+
+# Escape sequences
+escape: \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX
+
+# Common keys (Cargo.toml)
+cargo: [package] [dependencies] [dev-dependencies] [build-dependencies]
+cargo: [features] [workspace] [profile] [lib] [[bin]] [[example]] [[test]] [[bench]]
+cargo: name version edition authors description license repository homepage
+cargo: documentation readme keywords categories exclude include
+cargo: default-features optional path git branch tag rev features
+
+# Common keys (pyproject.toml)
+pyproject: [project] [build-system] [tool] [tool.poetry] [tool.pytest]
+pyproject: [tool.ruff] [tool.mypy] [tool.black] [tool.isort]
+pyproject: requires build-backend name version description authors license
+pyproject: readme requires-python classifiers dependencies optional-dependencies
+
+# Common keys (config files)
+config: [server] [database] [logging] [settings] [options]
+config: host port address url path timeout debug verbose level format

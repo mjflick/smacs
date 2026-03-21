@@ -1,0 +1,100 @@
+# HTML completion definitions for smacs
+
+# Tags - structural
+tag: html head body title base meta link header footer nav main section
+tag: article aside div span p br hr wbr
+
+# Tags - headings
+tag: h1 h2 h3 h4 h5 h6
+
+# Tags - text
+tag: a em strong small sub sup mark del ins abbr time pre code blockquote
+
+# Tags - lists
+tag: ul ol li
+
+# Tags - tables
+tag: table thead tbody tfoot tr td th caption col colgroup
+
+# Tags - forms
+tag: form input button select option textarea label fieldset legend
+tag: optgroup datalist output meter progress
+
+# Tags - media
+tag: img video audio source picture canvas svg iframe figure figcaption
+tag: map area
+
+# Tags - scripting
+tag: script style noscript
+
+# Tags - interactive
+tag: details summary dialog
+
+# Tags - web components
+tag: template slot
+
+# Attributes - core
+attribute: id class style title lang dir hidden tabindex accesskey
+attribute: draggable contenteditable spellcheck translate
+
+# Attributes - links and resources
+attribute: src href alt type name value rel media target download
+attribute: ping hreflang
+
+# Attributes - dimensions
+attribute: width height
+
+# Attributes - form
+attribute: action method placeholder required disabled checked selected
+attribute: readonly multiple autofocus autocomplete pattern min max step for
+
+# Attributes - meta/head
+attribute: charset content property http-equiv
+
+# Attributes - scripting
+attribute: defer async nomodule nonce
+
+# Attributes - security
+attribute: crossorigin integrity referrerpolicy sandbox
+
+# Attributes - iframe
+attribute: allow srcdoc
+
+# Attributes - media loading
+attribute: loading decoding fetchpriority
+
+# Attributes - ARIA
+attribute: role aria-label aria-labelledby aria-describedby aria-hidden
+attribute: aria-live aria-atomic aria-busy aria-controls aria-current
+attribute: aria-disabled aria-expanded aria-haspopup aria-invalid
+attribute: aria-pressed aria-readonly aria-required aria-selected
+attribute: aria-sort aria-valuemax aria-valuemin aria-valuenow aria-valuetext
+
+# Attributes - microdata
+attribute: itemscope itemprop itemtype itemid itemref
+
+# Attributes - web components
+attribute: slot part exportparts is
+
+# Attributes - misc
+attribute: enterkeyhint inputmode xmlns
+
+# Entities
+entity: &amp; &lt; &gt; &quot; &apos; &nbsp; &copy; &reg; &trade;
+entity: &mdash; &ndash; &hellip; &laquo; &raquo; &bull; &middot;
+entity: &lsquo; &rsquo; &ldquo; &rdquo; &ensp; &emsp; &thinsp;
+entity: &times; &divide; &plusmn; &deg; &micro; &para; &sect;
+entity: &larr; &rarr; &uarr; &darr; &harr;
+
+# Doctypes
+doctype: <!DOCTYPE html>
+
+# Event handlers
+event: onclick ondblclick onmousedown onmouseup onmouseover onmouseout
+event: onmousemove onmouseenter onmouseleave onkeydown onkeyup onkeypress
+event: onfocus onblur onchange oninput onsubmit onreset onselect
+event: onload onunload onresize onscroll onerror onabort
+event: ondrag ondragstart ondragend ondragover ondragenter ondragleave ondrop
+event: ontouchstart ontouchend ontouchmove ontouchcancel
+event: onanimationstart onanimationend onanimationiteration
+event: ontransitionend oncontextmenu onwheel onpointerdown onpointerup

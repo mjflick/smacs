@@ -1,0 +1,13 @@
+au BufRead,BufNewFile *.sh setfiletype sh
+au BufRead,BufNewFile *.bash setfiletype sh
+au BufRead,BufNewFile *.zsh setfiletype sh
+au BufRead,BufNewFile *.ksh setfiletype sh
+au BufRead,BufNewFile *.csh setfiletype sh
+au BufRead,BufNewFile *.tcsh setfiletype sh
+au BufRead,BufNewFile *.fish setfiletype sh
+au BufRead,BufNewFile .bashrc setfiletype sh
+au BufRead,BufNewFile .bash_profile setfiletype sh
+au BufRead,BufNewFile .bash_aliases setfiletype sh
+au BufRead,BufNewFile .zshrc setfiletype sh
+au BufRead,BufNewFile .profile setfiletype sh
+au BufRead,BufNewFile .kshrc setfiletype sh

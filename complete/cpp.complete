@@ -1,0 +1,150 @@
+# C++ completion definitions for smacs
+
+# C keywords (inherited)
+keyword: auto break case const continue default do else enum extern for goto
+keyword: if inline register restrict return sizeof static struct switch typedef
+keyword: union unsigned signed volatile while
+
+# C++ keywords
+keyword: class namespace template typename using try catch throw new delete
+keyword: virtual override final explicit friend constexpr consteval constinit
+keyword: concept requires co_await co_yield co_return noexcept nullptr
+keyword: decltype static_assert alignas alignof thread_local mutable
+keyword: export module import public private protected operator
+keyword: typeid dynamic_cast static_cast reinterpret_cast const_cast
+keyword: and or not and_eq or_eq not_eq xor xor_eq bitand bitor compl
+
+# C11/C23 keywords
+keyword: _Alignas _Alignof _Atomic _Bool _Complex _Generic _Imaginary
+keyword: _Noreturn _Static_assert _Thread_local
+
+# Preprocessor
+preprocessor: #include #define #undef #ifdef #ifndef #if #elif #else #endif
+preprocessor: #pragma #error #warning #line
+
+# C types (inherited)
+type: void int char short long float double size_t ssize_t ptrdiff_t
+type: int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+type: intptr_t uintptr_t intmax_t uintmax_t
+type: FILE DIR pid_t uid_t gid_t off_t mode_t time_t clock_t
+
+# C++ types
+type: bool wchar_t char8_t char16_t char32_t nullptr_t auto
+
+# STL containers
+type: string wstring string_view
+type: vector list deque array forward_list
+type: map multimap unordered_map unordered_multimap
+type: set multiset unordered_set unordered_multiset
+type: queue stack priority_queue
+type: pair tuple optional variant any
+type: bitset valarray complex span
+type: initializer_list type_info
+
+# Smart pointers
+type: shared_ptr unique_ptr weak_ptr
+type: enable_shared_from_this
+
+# Functional
+type: function bind reference_wrapper
+type: hash equal_to less greater
+
+# Concurrency
+type: thread mutex recursive_mutex timed_mutex
+type: lock_guard unique_lock shared_lock scoped_lock
+type: condition_variable condition_variable_any
+type: future promise packaged_task async
+type: atomic atomic_flag
+type: jthread stop_token stop_source
+
+# I/O streams
+type: istream ostream iostream fstream ifstream ofstream
+type: stringstream istringstream ostringstream
+type: streambuf filebuf stringbuf
+
+# Regex
+type: regex smatch cmatch wregex wsmatch
+
+# std:: qualified types
+type: std::string std::wstring std::string_view
+type: std::vector std::list std::deque std::array std::forward_list
+type: std::map std::multimap std::unordered_map std::unordered_multimap
+type: std::set std::multiset std::unordered_set std::unordered_multiset
+type: std::queue std::stack std::priority_queue
+type: std::pair std::tuple std::optional std::variant std::any
+type: std::shared_ptr std::unique_ptr std::weak_ptr
+type: std::function std::thread std::mutex std::atomic
+type: std::future std::promise std::condition_variable
+type: std::span std::bitset std::complex
+type: std::cout std::cin std::cerr std::clog std::endl
+
+# Constants
+constant: NULL nullptr true false
+constant: EOF BUFSIZ EXIT_SUCCESS EXIT_FAILURE
+constant: STDIN_FILENO STDOUT_FILENO STDERR_FILENO
+constant: std::npos
+
+# C standard library functions
+stdio: printf fprintf sprintf snprintf scanf fscanf sscanf
+stdio: puts fputs putchar fputc fgets getchar fgetc
+stdio: fopen fclose fflush fread fwrite fseek ftell rewind feof ferror
+stdio: remove rename perror
+
+stdlib: malloc calloc realloc free
+stdlib: atoi atol atof strtol strtoul strtod strtoll strtoull
+stdlib: abs labs rand srand exit atexit abort
+stdlib: getenv system qsort bsearch
+
+string: strlen strcmp strncmp strcpy strncpy strcat strncat
+string: strchr strrchr strstr strtok
+string: memcpy memmove memset memcmp memchr
+string: strerror strdup strndup
+
+# STL algorithms
+algorithm: std::sort std::stable_sort std::partial_sort std::nth_element
+algorithm: std::find std::find_if std::find_if_not std::find_first_of
+algorithm: std::count std::count_if std::search std::binary_search
+algorithm: std::lower_bound std::upper_bound std::equal_range
+algorithm: std::transform std::for_each std::copy std::copy_if std::copy_n
+algorithm: std::move std::move_backward std::swap std::swap_ranges
+algorithm: std::fill std::fill_n std::replace std::replace_if
+algorithm: std::remove std::remove_if std::unique std::reverse std::rotate std::shuffle
+algorithm: std::min std::max std::min_element std::max_element std::minmax std::minmax_element std::clamp
+algorithm: std::accumulate std::inner_product std::partial_sum std::adjacent_difference
+algorithm: std::reduce std::transform_reduce std::inclusive_scan std::exclusive_scan
+algorithm: std::all_of std::any_of std::none_of
+algorithm: std::distance std::advance std::next std::prev
+algorithm: std::begin std::end std::cbegin std::cend std::rbegin std::rend
+algorithm: std::iota std::generate std::generate_n
+algorithm: std::set_union std::set_intersection std::set_difference std::merge
+
+# Utility functions
+utility: std::make_pair std::make_tuple std::make_shared std::make_unique
+utility: std::forward std::move std::static_pointer_cast std::dynamic_pointer_cast
+utility: std::get std::tie std::ignore std::apply
+utility: std::to_string std::stoi std::stol std::stoll std::stof std::stod std::stold
+utility: std::getline std::swap
+
+# Math (cmath)
+math: sin cos tan asin acos atan atan2
+math: sinh cosh tanh
+math: exp log log10 log2 pow sqrt cbrt hypot
+math: ceil floor round trunc fmod fabs remainder
+math: isnan isinf isfinite
+math: M_PI M_E M_LN2 M_LN10 M_SQRT2
+
+# Memory
+memory: std::allocator std::allocator_traits
+memory: std::addressof std::align std::assume_aligned
+memory: std::construct_at std::destroy_at
+
+# I/O manipulators
+io: std::setw std::setprecision std::setfill std::fixed std::scientific
+io: std::hex std::dec std::oct std::boolalpha std::noboolalpha
+io: std::left std::right std::internal std::showpoint std::noshowpoint
+io: std::showbase std::noshowbase std::uppercase std::nouppercase
+
+# Time (chrono)
+chrono: std::chrono::system_clock std::chrono::steady_clock std::chrono::high_resolution_clock
+chrono: std::chrono::seconds std::chrono::milliseconds std::chrono::microseconds std::chrono::nanoseconds
+chrono: std::chrono::duration_cast std::chrono::time_point

@@ -1,0 +1,29 @@
+# YAML completion definitions for smacs
+
+# Boolean constants
+keyword: true false yes no on off True False Yes No On Off TRUE FALSE YES NO ON OFF
+
+# Null constants
+keyword: null Null NULL
+
+# Directives
+keyword: %YAML %TAG
+
+# Document markers
+keyword: --- ...
+
+# Tags
+type: !!str !!int !!float !!bool !!null !!seq !!map !!binary
+type: !!timestamp !!omap !!set !!pairs !!merge
+
+# Block scalar indicators
+keyword: | > |- >- |+ >+
+
+# Merge key
+keyword: <<
+
+# Common schema keys (Kubernetes, Docker Compose, GitHub Actions, etc.)
+schema: apiVersion kind metadata name namespace labels annotations spec
+schema: containers image ports env command args resources limits requests
+schema: version services build context dockerfile volumes networks
+schema: jobs steps runs-on uses with needs if strategy matrix

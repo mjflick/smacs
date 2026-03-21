@@ -1,0 +1,54 @@
+# XML completion definitions for smacs
+
+# Declaration
+keyword: <?xml version encoding standalone ?>
+
+# DOCTYPE keywords
+keyword: <!DOCTYPE SYSTEM PUBLIC ENTITY NOTATION ELEMENT ATTLIST
+
+# Common attributes
+attribute: xmlns id class name type value href src alt title lang
+attribute: encoding version standalone
+
+# Namespace prefixes
+namespace: xmlns xsi xsd xsl xs xlink svg rss atom
+
+# CDATA
+keyword: <![CDATA[ ]]>
+
+# Entities
+entity: &amp; &lt; &gt; &quot; &apos;
+entity: &#x &#
+
+# XSD types
+type: xs:string xs:integer xs:int xs:long xs:short xs:byte
+type: xs:decimal xs:float xs:double xs:boolean xs:date xs:dateTime
+type: xs:time xs:duration xs:base64Binary xs:hexBinary xs:anyURI
+type: xs:QName xs:NOTATION xs:normalizedString xs:token xs:language
+type: xs:positiveInteger xs:negativeInteger xs:nonNegativeInteger
+type: xs:nonPositiveInteger xs:unsignedLong xs:unsignedInt xs:unsignedShort
+type: xs:unsignedByte
+
+# XSD elements
+xsd: xs:schema xs:element xs:attribute xs:complexType xs:simpleType
+xsd: xs:sequence xs:choice xs:all xs:group xs:attributeGroup
+xsd: xs:restriction xs:extension xs:enumeration xs:pattern xs:minLength
+xsd: xs:maxLength xs:minInclusive xs:maxInclusive xs:minExclusive
+xsd: xs:maxExclusive xs:list xs:union xs:import xs:include xs:annotation
+xsd: xs:documentation xs:appinfo
+
+# XSLT elements
+xslt: xsl:stylesheet xsl:template xsl:apply-templates xsl:call-template
+xslt: xsl:value-of xsl:for-each xsl:if xsl:choose xsl:when xsl:otherwise
+xslt: xsl:variable xsl:param xsl:with-param xsl:sort xsl:output
+xslt: xsl:text xsl:element xsl:attribute xsl:copy xsl:copy-of
+xslt: xsl:import xsl:include xsl:key xsl:number xsl:decimal-format
+xslt: xsl:strip-space xsl:preserve-space xsl:namespace-alias xsl:message
+xslt: xsl:fallback xsl:processing-instruction xsl:comment
+
+# SVG elements
+svg: svg rect circle ellipse line polyline polygon path text tspan
+svg: g defs use symbol clipPath mask filter pattern marker
+svg: linearGradient radialGradient stop feGaussianBlur feOffset feBlend
+svg: feMerge feMergeNode feColorMatrix feComponentTransfer
+svg: animate animateTransform animateMotion set

@@ -1,0 +1,79 @@
+# JavaScript completion definitions for smacs
+
+# Keywords
+keyword: var let const function return if else for while do switch case default
+keyword: break continue throw try catch finally new delete typeof instanceof
+keyword: in of class extends super import export from as async await yield
+keyword: this void with debugger static get set
+
+# Types / Globals
+type: undefined null true false NaN Infinity globalThis
+type: window document navigator location history arguments
+
+# Built-in objects
+builtin: console Math JSON Object Array String Number Boolean
+builtin: Symbol BigInt Map Set WeakMap WeakSet
+builtin: Promise Proxy Reflect Date RegExp Error
+builtin: TypeError RangeError ReferenceError SyntaxError URIError EvalError
+builtin: AggregateError ArrayBuffer SharedArrayBuffer DataView
+builtin: Int8Array Uint8Array Int16Array Uint16Array Int32Array Uint32Array
+builtin: Float32Array Float64Array BigInt64Array BigUint64Array Uint8ClampedArray
+builtin: Intl WeakRef FinalizationRegistry
+
+# Built-in functions
+builtin: parseInt parseFloat isNaN isFinite eval
+builtin: encodeURI decodeURI encodeURIComponent decodeURIComponent
+builtin: setTimeout setInterval clearTimeout clearInterval
+builtin: fetch require module exports
+builtin: structuredClone queueMicrotask atob btoa
+builtin: requestAnimationFrame cancelAnimationFrame
+
+# Console methods
+console: console.log console.error console.warn console.info console.debug
+console: console.dir console.table console.time console.timeEnd console.trace
+console: console.assert console.count console.group console.groupEnd console.clear
+
+# Object methods
+object: Object.keys Object.values Object.entries Object.assign Object.create
+object: Object.defineProperty Object.defineProperties Object.freeze Object.seal
+object: Object.getPrototypeOf Object.setPrototypeOf Object.is
+object: Object.getOwnPropertyNames Object.getOwnPropertyDescriptor
+object: Object.hasOwn Object.fromEntries
+
+# Array methods
+array: Array.isArray Array.from Array.of
+array: push pop shift unshift splice slice concat
+array: map filter reduce reduceRight find findIndex findLast findLastIndex
+array: forEach some every includes indexOf lastIndexOf
+array: sort reverse fill flat flatMap join
+array: entries keys values at with toSorted toReversed toSpliced
+
+# String methods
+string: charAt charCodeAt codePointAt concat endsWith includes indexOf
+string: lastIndexOf match matchAll normalize padEnd padStart repeat
+string: replace replaceAll search slice split startsWith substring
+string: toLocaleLowerCase toLocaleUpperCase toLowerCase toUpperCase trim
+string: trimEnd trimStart at
+
+# Promise methods
+promise: Promise.resolve Promise.reject Promise.all Promise.allSettled
+promise: Promise.any Promise.race then catch finally
+
+# Math methods
+math: Math.abs Math.ceil Math.floor Math.round Math.trunc
+math: Math.max Math.min Math.pow Math.sqrt Math.cbrt Math.hypot
+math: Math.sin Math.cos Math.tan Math.asin Math.acos Math.atan Math.atan2
+math: Math.log Math.log2 Math.log10 Math.exp Math.random Math.sign
+math: Math.PI Math.E Math.LN2 Math.LN10 Math.SQRT2
+
+# JSON methods
+json: JSON.parse JSON.stringify
+
+# Date methods
+date: Date.now Date.parse Date.UTC
+date: getFullYear getMonth getDate getDay getHours getMinutes getSeconds
+date: getTime getTimezoneOffset toISOString toLocaleDateString toLocaleTimeString
+
+# Node.js globals
+node: process Buffer __dirname __filename global
+node: process.env process.argv process.exit process.cwd process.stdin process.stdout

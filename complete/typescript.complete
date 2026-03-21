@@ -1,0 +1,79 @@
+# TypeScript completion definitions for smacs
+
+# JavaScript keywords
+keyword: var let const function return if else for while do switch case default
+keyword: break continue throw try catch finally new delete typeof instanceof
+keyword: in of class extends super import export from as async await yield
+keyword: this void with debugger static get set
+
+# TypeScript-specific keywords
+keyword: type interface enum namespace declare implements abstract readonly
+keyword: keyof infer is asserts satisfies override accessor
+keyword: module require public private protected constructor
+
+# TypeScript types
+type: string number boolean void never unknown any object symbol bigint
+type: undefined null
+type: Record Partial Required Readonly Pick Omit Exclude Extract
+type: NonNullable ReturnType Parameters InstanceType Awaited
+type: ConstructorParameters ThisParameterType OmitThisParameter ThisType
+type: Uppercase Lowercase Capitalize Uncapitalize
+type: ReadonlyArray ReadonlyMap ReadonlySet
+type: PromiseLike ArrayLike Iterable Iterator AsyncIterable AsyncIterator
+
+# JavaScript globals
+type: undefined null true false NaN Infinity globalThis
+
+# Built-in objects
+builtin: console Math JSON Object Array String Number Boolean
+builtin: Symbol BigInt Map Set WeakMap WeakSet
+builtin: Promise Proxy Reflect Date RegExp Error
+builtin: TypeError RangeError ReferenceError SyntaxError URIError EvalError
+builtin: AggregateError ArrayBuffer SharedArrayBuffer DataView
+builtin: Int8Array Uint8Array Int16Array Uint16Array Int32Array Uint32Array
+builtin: Float32Array Float64Array BigInt64Array BigUint64Array Uint8ClampedArray
+builtin: Intl WeakRef FinalizationRegistry
+
+# Built-in functions
+builtin: parseInt parseFloat isNaN isFinite eval
+builtin: encodeURI decodeURI encodeURIComponent decodeURIComponent
+builtin: setTimeout setInterval clearTimeout clearInterval
+builtin: fetch require module exports structuredClone queueMicrotask atob btoa
+
+# Console methods
+console: console.log console.error console.warn console.info console.debug
+console: console.dir console.table console.time console.timeEnd console.trace
+
+# Object methods
+object: Object.keys Object.values Object.entries Object.assign Object.create
+object: Object.defineProperty Object.freeze Object.seal Object.is
+object: Object.getOwnPropertyNames Object.hasOwn Object.fromEntries
+
+# Array methods
+array: Array.isArray Array.from Array.of
+array: push pop shift unshift splice slice concat
+array: map filter reduce find findIndex forEach some every includes
+array: sort reverse fill flat flatMap join indexOf lastIndexOf
+array: at with toSorted toReversed toSpliced
+
+# String methods
+string: charAt charCodeAt concat endsWith includes indexOf lastIndexOf
+string: match matchAll padEnd padStart repeat replace replaceAll
+string: search slice split startsWith substring toLowerCase toUpperCase trim
+string: trimEnd trimStart at
+
+# Promise methods
+promise: Promise.resolve Promise.reject Promise.all Promise.allSettled
+promise: Promise.any Promise.race then catch finally
+
+# Math methods
+math: Math.abs Math.ceil Math.floor Math.round Math.trunc
+math: Math.max Math.min Math.pow Math.sqrt Math.random Math.sign
+math: Math.PI Math.E
+
+# JSON methods
+json: JSON.parse JSON.stringify
+
+# TypeScript decorators
+decorator: @Component @Injectable @Module @Controller @Service
+decorator: @Input @Output @ViewChild @HostListener

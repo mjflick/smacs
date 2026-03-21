@@ -1,0 +1,7 @@
+# JSON completion definitions for smacs
+
+# Constants
+keyword: true false null
+
+# Types (conceptual)
+type: string number object array boolean null

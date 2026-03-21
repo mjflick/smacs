@@ -1,0 +1,43 @@
+# Markdown completion definitions for smacs
+
+# Headers
+keyword: # ## ### #### ##### ######
+
+# Emphasis
+keyword: ** __ * _ ~~ *** ___
+
+# Code
+keyword: ` ``` ~~~
+
+# Lists
+keyword: - * + 1.
+
+# Task lists
+keyword: - [ ] - [x]
+
+# Links and images
+syntax: [text](url) [text][ref] ![alt](url) <url>
+
+# Blockquote
+keyword: >
+
+# Horizontal rules
+keyword: --- *** ___
+
+# Tables
+syntax: | --- |
+
+# Common fenced code block languages
+language: bash sh zsh python javascript typescript ruby go rust java
+language: c cpp csharp php swift kotlin scala perl lua r sql
+language: html css json yaml toml xml markdown
+language: dockerfile makefile cmake diff patch
+language: graphql protobuf thrift
+language: plaintext text txt console shell terminal
+
+# HTML entities commonly used in markdown
+entity: &amp; &lt; &gt; &nbsp; &mdash; &ndash; &hellip; &copy; &reg;
+
+# Frontmatter keys (YAML)
+frontmatter: title date author tags categories layout permalink description
+frontmatter: draft published excerpt image slug series weight
