@@ -73,6 +73,7 @@ our int $HIST_MAX;      # max entries per category
 
 our int $WHICH_FUNC;    # which-function-mode: 0=off, 1=on (default on)
 our int $FILL_COLUMN;   # fill-paragraph column width (default 70)
+our int $RECENTER;      # C-l cycle state: 0=center, 1=top, 2=bottom
 our str $LAST_SEARCH;   # last isearch query
 our str $LAST_BUFFER;   # previously viewed buffer name
 
@@ -2655,6 +2656,27 @@ func win_text_cols() int {
     return $w->{"width"};
 }
 
+func recenter() void {
+    my int $vis = win_edit_rows();
+    if ($RECENTER == 0) {
+        # Center cursor line on screen
+        $SY = $CY - $vis / 2;
+        $RECENTER = 1;
+    } elsif ($RECENTER == 1) {
+        # Cursor line at top of screen
+        $SY = $CY;
+        $RECENTER = 2;
+    } else {
+        # Cursor line at bottom of screen
+        $SY = $CY - $vis + 1;
+        $RECENTER = 0;
+    }
+    if ($SY < 0) {
+        $SY = 0;
+    }
+    render();
+}
+
 func scroll_adjust() void {
     my int $vis_rows = win_edit_rows();
     if ($CY < $SY) {
@@ -4596,7 +4618,7 @@ func hex_handle_key(str $key) void {
     if ($key eq "C-g") { set_msg("Quit"); return; }
 
     # Redraw
-    if ($key eq "C-l") { render(); return; }
+    if ($key eq "C-l") { recenter(); return; }
 
     # M-x for commands (including leaving hex mode)
     if ($key eq "M-x") { cmd_mx(); return; }
@@ -6162,7 +6184,7 @@ func describe_key(str $dk) void {
     if ($dk eq "C-s") { set_msg("C-s: isearch-forward"); return; }
     if ($dk eq "C-r") { set_msg("C-r: isearch-backward"); return; }
     if ($dk eq "C-g") { set_msg("C-g: keyboard-quit"); return; }
-    if ($dk eq "C-l") { set_msg("C-l: recenter"); return; }
+    if ($dk eq "C-l") { set_msg("C-l: recenter-top-bottom (cycles center/top/bottom)"); return; }
     if ($dk eq "C-o") { set_msg("C-o: other-window (split) / open-line (single)"); return; }
     if ($dk eq "C-_") { set_msg("C-_: undo"); return; }
     if ($dk eq "C- ") { set_msg("C-SPC: set-mark"); return; }
@@ -6359,7 +6381,7 @@ func show_help_bindings() void {
     push(@$lines, "Other:");
     push(@$lines, "  M-x            Execute command");
     push(@$lines, "  C-g            Cancel / keyboard quit");
-    push(@$lines, "  C-l            Redraw screen");
+    push(@$lines, "  C-l            Recenter (center/top/bottom)");
     push(@$lines, "");
     push(@$lines, "M-x Commands:");
     push(@$lines, "  goto-line, replace-regexp, replace-string,");
@@ -6387,6 +6409,11 @@ func handle_key(str $key) void {
 
     # Clear message on any key
     $MSG = "";
+
+    # Reset recenter cycle on any key except C-l
+    if ($key ne "C-l") {
+        $RECENTER = 0;
+    }
 
     # Hex mode takes over all key handling
     if ($HEX_MODE == 1) {
@@ -6509,7 +6536,7 @@ func handle_key(str $key) void {
     if ($key eq "C-s") { cmd_isearch(); return; }
     if ($key eq "C-r") { cmd_isearch(); return; }
     if ($key eq "C-g") { $MSET = 0; set_msg("Quit"); return; }
-    if ($key eq "C-l") { render(); return; }
+    if ($key eq "C-l") { recenter(); return; }
     if ($key eq "C-o") {
         if ($WIN_COUNT > 1) { win_other(); } else { undo_save(); insert_line($CY + 1, ""); $DIRTY = 1; }
         return;
@@ -6644,6 +6671,7 @@ func main() int {
     $HIST_MAX = 50;
     $WHICH_FUNC = 1;
     $FILL_COLUMN = 70;
+    $RECENTER = 0;
     $LAST_SEARCH = "";
     $LAST_BUFFER = "";
     $SYN_EXT_MAP = {};
