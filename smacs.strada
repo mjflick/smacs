@@ -6797,8 +6797,8 @@ func main() int {
     my int $argc = scalar(@args);
 
     # Check for --help / --version before entering TUI
-    if ($argc > 1) {
-        if ($args[1] eq "--help" || $args[1] eq "-h") {
+    if ($argc > 0) {
+        if ($args[0] eq "--help" || $args[0] eq "-h") {
             say("smacs - a lightweight Emacs-like text editor");
             say("");
             say("Usage: smacs [OPTIONS] [FILE ...]");
