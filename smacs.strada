@@ -3372,11 +3372,14 @@ func render() void {
         }
     }
 
-    # Position cursor in active window
+    # Position cursor in active window (clamp to valid screen range)
     my int $screen_y = $CY - $SY + $active_top + 1;
+    if ($screen_y < 1) { $screen_y = 1; }
+    if ($screen_y > $ROWS) { $screen_y = $ROWS; }
     my str $cur_line = get_line($CY);
     my int $cursor_col = u8_byte_to_col($cur_line, $CX);
     my int $screen_x = $cursor_col - $SX + 1 + $gutter + $active_left;
+    if ($screen_x < 1) { $screen_x = 1; }
     $out = $out . $E . "[" . $screen_y . ";" . $screen_x . "H";
 
     $out = $out . $E . "[?25h";
@@ -3844,6 +3847,100 @@ func edit_copy_region() void {
     $KILL = get_region_text();
     $MSET = 0;
     set_msg("Region copied.");
+}
+
+func get_comment_prefix() str {
+    # Try vim syntax line_comment first
+    if (defined($VIM_SYN) && length($SYNTAX) > 0 && defined($VIM_SYN->{$SYNTAX})) {
+        my str $lc = $VIM_SYN->{$SYNTAX}->{"line_comment"};
+        if (length($lc) > 0) {
+            return $lc;
+        }
+    }
+    # Fallback based on mode
+    if ($MODE eq "C" || $MODE eq "JavaScript" || $MODE eq "CSS" || $MODE eq "Strada") {
+        return "//";
+    }
+    if ($MODE eq "Perl" || $MODE eq "Python" || $MODE eq "Shell" || $MODE eq "Makefile") {
+        return "#";
+    }
+    if ($MODE eq "HTML") {
+        return "";
+    }
+    return "#";
+}
+
+func comment_region() void {
+    if ($MSET == 0) {
+        set_msg("No mark set.");
+        return;
+    }
+    my str $prefix = get_comment_prefix();
+    if (length($prefix) == 0) {
+        set_msg("No line comment style for this mode.");
+        return;
+    }
+    undo_save();
+    my int $sy = $MY;
+    my int $ey = $CY;
+    if ($sy > $ey) {
+        my int $tmp = $sy;
+        $sy = $ey;
+        $ey = $tmp;
+    }
+    my str $cmt = $prefix . " ";
+    my int $r = $sy;
+    while ($r <= $ey) {
+        set_line($r, $cmt . get_line($r));
+        $r = $r + 1;
+    }
+    $MSET = 0;
+    $DIRTY = 1;
+    set_msg("Region commented.");
+}
+
+func uncomment_region() void {
+    if ($MSET == 0) {
+        set_msg("No mark set.");
+        return;
+    }
+    my str $prefix = get_comment_prefix();
+    if (length($prefix) == 0) {
+        set_msg("No line comment style for this mode.");
+        return;
+    }
+    undo_save();
+    my int $sy = $MY;
+    my int $ey = $CY;
+    if ($sy > $ey) {
+        my int $tmp = $sy;
+        $sy = $ey;
+        $ey = $tmp;
+    }
+    my int $plen = length($prefix);
+    my int $r = $sy;
+    while ($r <= $ey) {
+        my str $line = get_line($r);
+        # Find leading whitespace
+        my int $ws = 0;
+        while ($ws < length($line) && (substr($line, $ws, 1) eq " " || substr($line, $ws, 1) eq "\t")) {
+            $ws = $ws + 1;
+        }
+        # Check for prefix optionally followed by a space
+        if ($ws + $plen <= length($line) && substr($line, $ws, $plen) eq $prefix) {
+            my int $strip = $plen;
+            if ($ws + $plen < length($line) && substr($line, $ws + $plen, 1) eq " ") {
+                $strip = $plen + 1;
+            }
+            my str $before = "";
+            if ($ws > 0) { $before = substr($line, 0, $ws); }
+            set_line($r, $before . substr($line, $ws + $strip));
+        }
+        $r = $r + 1;
+    }
+    $MSET = 0;
+    $DIRTY = 1;
+    set_msg("Region uncommented.");
 }
 
 func fill_paragraph() void {
@@ -4788,7 +4885,8 @@ func complete_mx(str $input) array {
         "completion-mode", "reload-completions",
         "text-mode", "strada-mode", "c-mode", "perl-mode",
         "python-mode", "javascript-mode", "html-mode", "css-mode",
-        "shell-mode", "makefile-mode", "markdown-mode");
+        "shell-mode", "makefile-mode", "markdown-mode",
+        "comment-region", "uncomment-region");
     my array @matches = ();
     my int $i = 0;
     while ($i < scalar(@cmds)) {
@@ -5724,6 +5822,8 @@ func cmd_mx() void {
     if ($cmd eq "shell-mode") { set_mode("Shell"); return; }
     if ($cmd eq "makefile-mode") { set_mode("Makefile"); return; }
     if ($cmd eq "markdown-mode") { set_mode("Markdown"); return; }
+    if ($cmd eq "comment-region") { comment_region(); return; }
+    if ($cmd eq "uncomment-region") { uncomment_region(); return; }
 
     set_msg("Unknown command: " . $cmd);
 }
