@@ -6,7 +6,7 @@ PCRE2_LIB := $(shell pkg-config --libs libpcre2-8 2>/dev/null || echo "")
 all: smacs
 
 smacs: smacs.strada
-	$(STRADA) smacs.strada
+	$(STRADA) -O3 smacs.strada
 
 debug: smacs.strada
 	$(STRADA) -g smacs.strada

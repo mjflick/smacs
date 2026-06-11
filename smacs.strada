@@ -46,6 +46,9 @@ our str $MSG;           # message bar text
 our int $MSG_TIME;      # when message was set (unused, for future timeout)
 
 our str $KILL;          # kill ring (single entry)
+our int $LAST_KILL;     # 1 if the previous command was a kill (C-k appends)
+our int $INSERT_GROUP;  # chars in current self-insert undo group (0 = none)
+our str $PASTE_BUF;     # text captured from a bracketed paste
 our int $MY;            # mark line
 our int $MX;            # mark col
 our int $MSET;          # mark active?
@@ -118,8 +121,8 @@ func disable_raw() void {
 
 func suspend() void {
     disable_raw();
-    # Show cursor, exit alt screen
-    core::write_fd(1, chr(27) . "[?25h" . chr(27) . "[?1049l");
+    # Disable bracketed paste, show cursor, exit alt screen
+    core::write_fd(1, chr(27) . "[?2004l" . chr(27) . "[?25h" . chr(27) . "[?1049l");
     # Restore default SIGTSTP handler so the signal actually stops us
     core::signal("TSTP", "DEFAULT");
     # Send SIGTSTP to self
@@ -127,7 +130,7 @@ func suspend() void {
     # When we resume (fg), re-enter raw mode and redraw
     core::signal("TSTP", "IGNORE");
     enable_raw();
-    core::write_fd(1, chr(27) . "[?1049h");
+    core::write_fd(1, chr(27) . "[?1049h" . chr(27) . "[?2004h");
     update_size();
     render();
 }
@@ -231,13 +234,53 @@ func u8_char_width(str $s, int $pos) int {
     return 1;
 }
 
-# Display width of a string (accounts for multi-byte and wide chars)
+# Display width of the char at byte $pos given the current display column.
+# Tabs advance to the next $TAB_WIDTH stop, so their width depends on $col.
+func char_width_at(str $s, int $pos, int $col) int {
+    my int $b = core::get_byte($s, $pos);
+    if ($b == 9) {
+        my int $tw = $TAB_WIDTH;
+        if ($tw < 1) { $tw = 1; }
+        return $tw - ($col % $tw);
+    }
+    return u8_char_width($s, $pos);
+}
+
+# Expand tabs to spaces using $TAB_WIDTH stops (for rendering)
+func expand_tabs(str $s) str {
+    if (index($s, "\t") < 0) { return $s; }
+    my str $out = "";
+    my int $col = 0;
+    my int $pos = 0;
+    my int $len = length($s);
+    while ($pos < $len) {
+        my int $b = core::get_byte($s, $pos);
+        if ($b == 9) {
+            my int $w = char_width_at($s, $pos, $col);
+            my int $i = 0;
+            while ($i < $w) {
+                $out = $out . " ";
+                $i = $i + 1;
+            }
+            $col = $col + $w;
+            $pos = $pos + 1;
+        } else {
+            my int $nx = u8_next($s, $pos);
+            $out = $out . substr($s, $pos, $nx - $pos);
+            $col = $col + u8_char_width($s, $pos);
+            $pos = $nx;
+        }
+    }
+    return $out;
+}
+
+# Display width of a string (accounts for multi-byte, wide chars, and tabs)
 func u8_str_width(str $s) int {
     my int $w = 0;
     my int $pos = 0;
     my int $len = length($s);
     while ($pos < $len) {
-        $w = $w + u8_char_width($s, $pos);
+        $w = $w + char_width_at($s, $pos, $w);
         $pos = u8_next($s, $pos);
     }
     return $w;
@@ -248,7 +291,7 @@ func u8_byte_to_col(str $s, int $byte_pos) int {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < $byte_pos && $pos < length($s)) {
-        $col = $col + u8_char_width($s, $pos);
+        $col = $col + char_width_at($s, $pos, $col);
         $pos = u8_next($s, $pos);
     }
     return $col;
@@ -260,7 +303,7 @@ func u8_col_to_byte(str $s, int $target_col) int {
     my int $pos = 0;
     my int $len = length($s);
     while ($pos < $len && $col < $target_col) {
-        $col = $col + u8_char_width($s, $pos);
+        $col = $col + char_width_at($s, $pos, $col);
         $pos = u8_next($s, $pos);
     }
     return $pos;
@@ -272,7 +315,7 @@ func u8_truncate(str $s, int $max_cols) str {
     my int $pos = 0;
     my int $len = length($s);
     while ($pos < $len) {
-        my int $w = u8_char_width($s, $pos);
+        my int $w = char_width_at($s, $pos, $col);
         if ($col + $w > $max_cols) {
             return substr($s, 0, $pos);
         }
@@ -288,7 +331,7 @@ func u8_skip_cols(str $s, int $skip_cols) str {
     my int $pos = 0;
     my int $len = length($s);
     while ($pos < $len && $col < $skip_cols) {
-        $col = $col + u8_char_width($s, $pos);
+        $col = $col + char_width_at($s, $pos, $col);
         $pos = u8_next($s, $pos);
     }
     if ($pos >= $len) { return ""; }
@@ -301,6 +344,43 @@ func u8_skip_cols(str $s, int $skip_cols) str {
 
 func read_byte() int {
     return core::read_byte(0);
+}
+
+# Read bracketed-paste data until the ESC[201~ terminator.
+# Stores the text in $PASTE_BUF and returns the "PASTE" pseudo-key.
+func read_paste() str {
+    my str $data = "";
+    my str $term = chr(27) . "[201~";
+    my int $tlen = 6;
+    my int $ti = 0;      # terminator bytes matched so far
+    my int $misses = 0;  # consecutive read timeouts
+    while (1) {
+        my int $b = read_byte();
+        if ($b == -1) {
+            $misses = $misses + 1;
+            if ($misses > 100) { last; }
+            next;
+        }
+        $misses = 0;
+        my int $expect = core::get_byte($term, $ti);
+        if ($b == $expect) {
+            $ti = $ti + 1;
+            if ($ti >= $tlen) { last; }
+        } else {
+            # Flush a partial terminator match back into the data
+            if ($ti > 0) {
+                $data = $data . substr($term, 0, $ti);
+                $ti = 0;
+            }
+            if ($b == 27) {
+                $ti = 1;
+            } else {
+                $data = $data . core::pack("C", $b);
+            }
+        }
+    }
+    $PASTE_BUF = $data;
+    return "PASTE";
 }
 
 func read_key() str {
@@ -343,7 +423,7 @@ func read_key() str {
             # CSI sequence: ESC [
             my int $c3 = read_byte();
             if ($c3 == -1) {
-                return "ESC";
+                return "";
             }
             if ($c3 == 65) { return "UP"; }
             if ($c3 == 66) { return "DOWN"; }
@@ -369,13 +449,15 @@ func read_key() str {
                     if ($params eq "6") { return "PGDN"; }
                     # xterm modifyOtherKeys: ESC[27;2;13~ = Shift+Enter
                     if ($params eq "27;2;13") { return "RET"; }
-                    return "ESC";
+                    # Bracketed paste: ESC[200~ <data> ESC[201~
+                    if ($params eq "200") { return read_paste(); }
+                    return "";
                 }
                 # kitty keyboard protocol: ESC[code;modifiersu
                 if ($final == 117) {
                     # Shift+Enter: ESC[13;2u
                     if ($params eq "13;2") { return "RET"; }
-                    return "ESC";
+                    return "";
                 }
                 # Shift+arrow keys: ESC[1;2A/B/C/D
                 if ($params eq "1;2") {
@@ -391,9 +473,25 @@ func read_key() str {
                     if ($final == 67) { return "M-RIGHT"; }
                     if ($final == 68) { return "M-LEFT"; }
                 }
-                return "ESC";
+                # Unknown parameterized sequence: swallow it
+                return "";
             }
-            return "ESC";
+            # Unknown CSI (F-keys, mouse, etc.): swallow so the trailing
+            # bytes don't leak into the buffer as literal text
+            return "";
+        }
+        # SS3 sequences: ESC O <final> (F1-F4, application-mode cursor keys)
+        if ($c2 == 79) {
+            my int $c3 = read_byte();
+            if ($c3 == -1) { return "M-O"; }
+            if ($c3 == 65) { return "UP"; }
+            if ($c3 == 66) { return "DOWN"; }
+            if ($c3 == 67) { return "RIGHT"; }
+            if ($c3 == 68) { return "LEFT"; }
+            if ($c3 == 72) { return "HOME"; }
+            if ($c3 == 70) { return "END"; }
+            # F1-F4 and friends: swallow
+            return "";
         }
         # Alt+Tab (ESC + TAB)
         if ($c2 == 9) {
@@ -413,15 +511,19 @@ func read_key() str {
     if ($c >= 32 && $c <= 126) {
         return chr($c);
     }
-    # UTF-8 multi-byte: read full sequence
+    # UTF-8 multi-byte: read the full sequence as raw bytes.
+    # (core::pack, not chr -- chr(>=128) builds a character string whose
+    # length() counts codepoints, which breaks the editor's byte math
+    # and double-encodes when concatenated into byte-string buffer lines)
     if ($c >= 128) {
         my int $seq_len = u8_seq_len($c);
-        my str $result = chr($c);
+        if ($seq_len < 2) { return ""; }  # stray continuation byte
+        my str $result = core::pack("C", $c);
         my int $bi = 1;
         while ($bi < $seq_len) {
             my int $nb = read_byte();
-            if ($nb < 0) { return $result; }
-            $result = $result . chr($nb);
+            if ($nb < 0) { return ""; }
+            $result = $result . core::pack("C", $nb);
             $bi = $bi + 1;
         }
         return $result;
@@ -927,6 +1029,20 @@ func buf_switch(str $name) void {
     $LAST_BUFFER = $prev;
 }
 
+# Is any buffer (including the current one) modified?
+func any_buffer_dirty() int {
+    buf_save_state();
+    my int $i = 0;
+    while ($i < scalar(@$BUFFERS)) {
+        my scalar $b = $BUFFERS->[$i];
+        if (defined($b->{"dirty"}) && $b->{"dirty"} == 1) {
+            return 1;
+        }
+        $i = $i + 1;
+    }
+    return 0;
+}
+
 func buf_names() str {
     my str $out = "";
     my int $i = 0;
@@ -1005,19 +1121,24 @@ func unique_dir_part(str $filepath, str $basename) str {
 }
 
 func file_open(str $path) void {
+    my int $is_new = 0;
+    my scalar $lines = [];
     my scalar $fh = core::open($path, "r");
     if (!defined($fh)) {
-        set_msg("Cannot open: " . $path);
-        return;
+        if (file_exists($path) == 1) {
+            set_msg("Cannot open: " . $path);
+            return;
+        }
+        # File doesn't exist yet: edit an empty buffer, create on save
+        $is_new = 1;
+    } else {
+        my str $line = <$fh>;
+        while (defined($line)) {
+            push(@$lines, $line);
+            $line = <$fh>;
+        }
+        core::close($fh);
     }
-    # Clear current lines
-    my scalar $lines = [];
-    my str $line = <$fh>;
-    while (defined($line)) {
-        push(@$lines, $line);
-        $line = <$fh>;
-    }
-    core::close($fh);
     if (scalar(@$lines) == 0) {
         push(@$lines, "");
     }
@@ -1071,7 +1192,11 @@ func file_open(str $path) void {
     $b2->{"mode"} = $MODE;
     $b2->{"filename"} = $path;
     $b2->{"syntax"} = $SYNTAX;
-    set_msg("Opened: " . $path);
+    if ($is_new == 1) {
+        set_msg($path . " (New file)");
+    } else {
+        set_msg("Opened: " . $path);
+    }
 }
 
 func file_save() void {
@@ -1085,7 +1210,7 @@ func file_save() void {
             set_msg("Save cancelled.");
             return;
         }
-        $FNAME = $path;
+        $FNAME = expand_tilde($path);
     }
     my scalar $fh = core::open($FNAME, "w");
     if (!defined($fh)) {
@@ -1615,6 +1740,7 @@ func comp_accept() void {
         return;
     }
     undo_save();
+    $INSERT_GROUP = 0;
     my str $word = $COMP_LIST->[$COMP_IDX];
     my str $line = get_line($CY);
     my int $ps = $CX - length($COMP_PREFIX);
@@ -3158,7 +3284,7 @@ func render() void {
                     $row_content = $row_content . $E . "[90m" . $pad_str . $num . " " . $E . "[0m";
                 }
                 my str $raw = get_line($filerow);
-                my str $display = $raw;
+                my str $display = expand_tabs($raw);
                 if ($SX > 0) {
                     $display = u8_skip_cols($display, $SX);
                 }
@@ -3211,7 +3337,8 @@ func render() void {
                         # Status bar row separator
                         $out = $out . $E . "[7m|" . $E . "[0m";
                     } else {
-                        my str $vline = chr(0xE2) . chr(0x94) . chr(0x82);
+                        # Box-drawing vertical bar as raw UTF-8 bytes
+                        my str $vline = core::pack("C", 0xE2) . core::pack("C", 0x94) . core::pack("C", 0x82);
                         $out = $out . $E . "[90m" . $vline . $E . "[0m";
                     }
                     $sr = $sr + 1;
@@ -3253,7 +3380,7 @@ func render() void {
         my str $hl = $E . "[1;33;44m";
         my str $rst = $E . "[0m";
         my int $cy_screen = $CY - $SY + $active_top;
-        my int $cx_screen = $CX - $SX;
+        my int $cx_screen = u8_byte_to_col(get_line($CY), $CX) - $SX;
         if ($cy_screen >= $active_top && $cy_screen < $active_top + $active_height && $cx_screen >= 0 && $cx_screen < $text_cols) {
             my str $bch = substr(get_line($CY), $CX, 1);
             my int $brow = $cy_screen + 1;
@@ -3262,7 +3389,7 @@ func render() void {
         }
         if ($match_y >= 0) {
             my int $my_screen = $match_y - $SY + $active_top;
-            my int $mx_screen = $match_x - $SX;
+            my int $mx_screen = u8_byte_to_col(get_line($match_y), $match_x) - $SX;
             if ($my_screen >= $active_top && $my_screen < $active_top + $active_height && $mx_screen >= 0 && $mx_screen < $text_cols) {
                 my str $mch = substr(get_line($match_y), $match_x, 1);
                 my int $mrow = $my_screen + 1;
@@ -3293,20 +3420,37 @@ func render() void {
             my int $scr_y = $ry - $SY + $active_top;
             if ($scr_y >= $active_top && $scr_y < $active_top + $active_height) {
                 my str $rline = get_line($ry);
-                my int $col_start = 0;
-                my int $col_end = length($rline);
-                if ($ry == $rsy) { $col_start = $rsx; }
-                if ($ry == $rey) { $col_end = $rex; }
-                my int $rc = $col_start;
-                while ($rc < $col_end) {
-                    my int $scr_x = $rc - $SX;
-                    if ($scr_x >= 0 && $scr_x < $text_cols) {
-                        my str $rch = substr($rline, $rc, 1);
+                my int $byte_start = 0;
+                my int $byte_end = length($rline);
+                if ($ry == $rsy) { $byte_start = $rsx; }
+                if ($ry == $rey) { $byte_end = $rex; }
+                # Walk chars, tracking display column (tab/multibyte aware)
+                my int $bp = 0;
+                my int $rcl = 0;
+                while ($bp < $byte_start && $bp < length($rline)) {
+                    $rcl = $rcl + char_width_at($rline, $bp, $rcl);
+                    $bp = u8_next($rline, $bp);
+                }
+                while ($bp < $byte_end && $bp < length($rline)) {
+                    my int $w = char_width_at($rline, $bp, $rcl);
+                    my int $nx = u8_next($rline, $bp);
+                    my str $rch = substr($rline, $bp, $nx - $bp);
+                    if ($rch eq "\t") {
+                        $rch = "";
+                        my int $twi = 0;
+                        while ($twi < $w) {
+                            $rch = $rch . " ";
+                            $twi = $twi + 1;
+                        }
+                    }
+                    my int $scr_x = $rcl - $SX;
+                    if ($scr_x >= 0 && $scr_x + $w <= $text_cols) {
                         my int $rrow = $scr_y + 1;
                         my int $rcol = $scr_x + 1 + $gutter + $active_left;
                         $out = $out . $E . "[" . $rrow . ";" . $rcol . "H" . $rhl . $rch . $rrst;
                     }
-                    $rc = $rc + 1;
+                    $rcl = $rcl + $w;
+                    $bp = $nx;
                 }
             }
             $ry = $ry + 1;
@@ -3518,8 +3662,8 @@ func move_backward_word() void {
 # Editing
 # ===========================================================================
 
-func edit_insert(str $ch) void {
-    undo_save();
+# Insert text at the cursor without touching the undo stack
+func insert_raw(str $ch) void {
     my str $line = get_line($CY);
     my str $before = "";
     if ($CX > 0) {
@@ -3532,6 +3676,17 @@ func edit_insert(str $ch) void {
     set_line($CY, $before . $ch . $after);
     $CX = $CX + length($ch);
     $DIRTY = 1;
+}
+
+func edit_insert(str $ch) void {
+    # Group runs of consecutive self-inserts into one undo entry
+    # (snapshot at the start of each run, and every 20 chars)
+    if ($INSERT_GROUP == 0 || $INSERT_GROUP >= 20) {
+        undo_save();
+        $INSERT_GROUP = 0;
+    }
+    $INSERT_GROUP = $INSERT_GROUP + 1;
+    insert_raw($ch);
 }
 
 func edit_newline() void {
@@ -3681,21 +3836,33 @@ func edit_delete() void {
 }
 
 func edit_kill_line() void {
-    undo_save();
     my str $line = get_line($CY);
+    my str $killed = "";
     if ($CX < length($line)) {
-        $KILL = substr($line, $CX);
+        undo_save();
+        $killed = substr($line, $CX);
         my str $before = "";
         if ($CX > 0) {
             $before = substr($line, 0, $CX);
         }
         set_line($CY, $before);
     } elsif ($CY < line_count() - 1) {
-        $KILL = "\n";
+        undo_save();
+        $killed = "\n";
         my str $next = get_line($CY + 1);
         set_line($CY, $line . $next);
         delete_line($CY + 1);
+    } else {
+        # End of buffer: nothing to kill
+        return;
     }
+    # Consecutive kills accumulate so C-k C-k ... C-y moves whole blocks
+    if ($LAST_KILL == 1) {
+        $KILL = $KILL . $killed;
+    } else {
+        $KILL = $killed;
+    }
+    $LAST_KILL = 1;
     $DIRTY = 1;
 }
 
@@ -3751,6 +3918,58 @@ func edit_yank() void {
         $CX = length($last_part);
     }
     $DIRTY = 1;
+}
+
+# Insert bracketed-paste text at the cursor as a single undoable edit
+func paste_insert() void {
+    my str $text = $PASTE_BUF;
+    $PASTE_BUF = "";
+    if (length($text) == 0) { return; }
+    # Normalize line endings (\r\n and \r -> \n) and strip control bytes
+    my str $norm = "";
+    my int $i = 0;
+    my int $len = length($text);
+    while ($i < $len) {
+        my int $b = core::get_byte($text, $i);
+        if ($b == 13) {
+            $norm = $norm . "\n";
+            if ($i + 1 < $len && core::get_byte($text, $i + 1) == 10) {
+                $i = $i + 1;
+            }
+        } elsif ($b < 32 && $b != 9 && $b != 10) {
+            # drop other control bytes
+        } else {
+            $norm = $norm . substr($text, $i, 1);
+        }
+        $i = $i + 1;
+    }
+    if (length($norm) == 0) { return; }
+    undo_save();
+    $INSERT_GROUP = 0;
+    my array @parts = split("\n", $norm);
+    my str $line = get_line($CY);
+    my str $before = "";
+    if ($CX > 0) { $before = substr($line, 0, $CX); }
+    my str $after = "";
+    if ($CX < length($line)) { $after = substr($line, $CX); }
+    if (scalar(@parts) <= 1) {
+        set_line($CY, $before . $norm . $after);
+        $CX = $CX + length($norm);
+    } else {
+        set_line($CY, $before . $parts[0]);
+        my int $pi = 1;
+        while ($pi < scalar(@parts) - 1) {
+            insert_line($CY + $pi, $parts[$pi]);
+            $pi = $pi + 1;
+        }
+        my int $last_idx = scalar(@parts) - 1;
+        my str $last_part = $parts[$last_idx];
+        insert_line($CY + $last_idx, $last_part . $after);
+        $CY = $CY + $last_idx;
+        $CX = length($last_part);
+    }
+    $DIRTY = 1;
+    set_msg("Pasted " . length($norm) . " bytes.");
 }
 
 func edit_set_mark() void {
@@ -4090,12 +4309,13 @@ func fill_paragraph() void {
 
 func edit_tab() void {
     undo_save();
+    $INSERT_GROUP = 0;
     if ($INDENT_TABS == 1) {
-        edit_insert("\t");
+        insert_raw("\t");
     } else {
         my int $i = 0;
         while ($i < $TAB_WIDTH) {
-            edit_insert(" ");
+            insert_raw(" ");
             $i = $i + 1;
         }
     }
@@ -4351,7 +4571,7 @@ func hex_leave_mode() void {
             push(@$lines, $cur);
             $cur = "";
         } else {
-            $cur = $cur . chr($b);
+            $cur = $cur . core::pack("C", $b);
         }
         $i = $i + 1;
     }
@@ -4386,7 +4606,7 @@ func hex_set_byte(int $pos, int $byte_val) void {
     if ($pos + 1 < $total) {
         $after = substr($data, $pos + 1);
     }
-    $buf->{"hex_data"} = $before . chr($byte_val) . $after;
+    $buf->{"hex_data"} = $before . core::pack("C", $byte_val) . $after;
 }
 
 func hex_char_to_nibble(str $ch) int {
@@ -4590,7 +4810,7 @@ func hex_file_save() void {
             set_msg("Save cancelled.");
             return;
         }
-        $FNAME = $path;
+        $FNAME = expand_tilde($path);
     }
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     my str $data = $buf->{"hex_data"};
@@ -4630,6 +4850,13 @@ func hex_goto_offset() void {
 }
 
 func hex_handle_key(str $key) void {
+    # Hex mode doesn't take pasted text
+    if ($key eq "PASTE") {
+        $PASTE_BUF = "";
+        set_msg("Paste ignored in hex mode.");
+        return;
+    }
+
     # ESC as Meta prefix
     if ($key eq "ESC") {
         set_msg("ESC-");
@@ -4661,8 +4888,8 @@ func hex_handle_key(str $key) void {
         if ($next eq "C-s") {
             hex_file_save();
         } elsif ($next eq "C-c") {
-            if ($DIRTY == 1) {
-                my int $yn = mb_read_yn("Modified; exit anyway?");
+            if (any_buffer_dirty() == 1) {
+                my int $yn = mb_read_yn("Modified buffers exist; exit anyway?");
                 if ($yn != 1) { set_msg("Cancelled."); return; }
             }
             $RUNNING = 0;
@@ -4678,7 +4905,7 @@ func hex_handle_key(str $key) void {
             # Save as
             my str $path = mb_read("Write file: ");
             if (length($path) > 0) {
-                $FNAME = $path;
+                $FNAME = expand_tilde($path);
                 hex_file_save();
             }
         } else {
@@ -5036,7 +5263,7 @@ func mb_read_complete_hist(str $prompt, str $mode, str $hist_cat) str {
             $disp_input = "..." . substr($disp_input, $skip);
         }
         $out = $out . $prompt . $disp_input;
-        my int $cursor_col = length($prompt) + $pos + 1;
+        my int $cursor_col = length($prompt) + u8_str_width(substr($input, 0, $pos)) + 1;
         if (length($input) > $avail && $avail > 3) {
             my int $skip = length($input) - $avail + 3;
             $cursor_col = length($prompt) + 3 + ($pos - $skip) + 1;
@@ -5120,22 +5347,40 @@ func mb_read_complete_hist(str $prompt, str $mode, str $hist_cat) str {
         }
         if ($key eq "BACKSPACE" || $key eq "C-h") {
             if ($pos > 0) {
-                $input = substr($input, 0, $pos - 1) . substr($input, $pos);
-                $pos = $pos - 1;
+                my int $pp = u8_prev($input, $pos);
+                $input = substr($input, 0, $pp) . substr($input, $pos);
+                $pos = $pp;
             }
             next;
         }
         if ($key eq "C-a") { $pos = 0; next; }
         if ($key eq "C-e") { $pos = length($input); next; }
         if ($key eq "LEFT" || $key eq "C-b") {
-            if ($pos > 0) { $pos = $pos - 1; }
+            if ($pos > 0) { $pos = u8_prev($input, $pos); }
             next;
         }
         if ($key eq "RIGHT" || $key eq "C-f") {
-            if ($pos < length($input)) { $pos = $pos + 1; }
+            if ($pos < length($input)) { $pos = u8_next($input, $pos); }
             next;
         }
         if ($key eq "C-k") { $input = substr($input, 0, $pos); next; }
+        if ($key eq "PASTE") {
+            my str $ptxt = $PASTE_BUF;
+            $PASTE_BUF = "";
+            my int $pnl = index($ptxt, "\n");
+            if ($pnl >= 0) { $ptxt = substr($ptxt, 0, $pnl); }
+            my int $pcr = index($ptxt, "\r");
+            if ($pcr >= 0) { $ptxt = substr($ptxt, 0, $pcr); }
+            if (length($ptxt) > 0) {
+                my str $pb = "";
+                if ($pos > 0) { $pb = substr($input, 0, $pos); }
+                my str $pa = "";
+                if ($pos < length($input)) { $pa = substr($input, $pos); }
+                $input = $pb . $ptxt . $pa;
+                $pos = $pos + length($ptxt);
+            }
+            next;
+        }
         if ($key eq "M-BACKSPACE") {
             if ($pos > 0) {
                 my int $end = $pos;
@@ -5153,17 +5398,21 @@ func mb_read_complete_hist(str $prompt, str $mode, str $hist_cat) str {
             }
             next;
         }
-        # Insert printable character
+        # Insert printable character (ASCII or multi-byte UTF-8)
+        my int $ins_ok = 0;
         if (length($key) == 1) {
             my int $code = ord($key);
-            if ($code >= 32 && $code <= 126) {
-                my str $before = "";
-                if ($pos > 0) { $before = substr($input, 0, $pos); }
-                my str $after = "";
-                if ($pos < length($input)) { $after = substr($input, $pos); }
-                $input = $before . $key . $after;
-                $pos = $pos + 1;
-            }
+            if ($code >= 32 && $code <= 126) { $ins_ok = 1; }
+        } elsif (length($key) > 1) {
+            if (core::get_byte($key, 0) >= 128) { $ins_ok = 1; }
+        }
+        if ($ins_ok == 1) {
+            my str $before = "";
+            if ($pos > 0) { $before = substr($input, 0, $pos); }
+            my str $after = "";
+            if ($pos < length($input)) { $after = substr($input, $pos); }
+            $input = $before . $key . $after;
+            $pos = $pos + length($key);
         }
     }
     return "";
@@ -5213,23 +5462,40 @@ func cmd_isearch() void {
         if (length($query) > 0) {
             my int $gutter = linum_width();
             my int $msy = $CY - $SY;
-            my int $msx = $CX - $SX;
-            if ($msy >= 0 && $msy < $EDIT_ROWS && $msx >= 0) {
+            if ($msy >= 0 && $msy < $EDIT_ROWS) {
                 my str $hl = $E . "[1;33;44m";
                 my str $rst = $E . "[0m";
                 my str $mline = get_line($CY);
                 my int $qlen = length($query);
                 my int $mlen = length($mline);
-                my int $mi = 0;
-                while ($mi < $qlen && $CX + $mi < $mlen) {
-                    my int $scol = $msx + $mi;
-                    if ($scol >= 0 && $scol < $COLS) {
-                        my str $mch = substr($mline, $CX + $mi, 1);
+                # Walk chars to the match, tracking display column
+                my int $bp = 0;
+                my int $mcl = 0;
+                while ($bp < $CX && $bp < $mlen) {
+                    $mcl = $mcl + char_width_at($mline, $bp, $mcl);
+                    $bp = u8_next($mline, $bp);
+                }
+                my int $mend = $CX + $qlen;
+                while ($bp < $mend && $bp < $mlen) {
+                    my int $w = char_width_at($mline, $bp, $mcl);
+                    my int $nx = u8_next($mline, $bp);
+                    my str $mch = substr($mline, $bp, $nx - $bp);
+                    if ($mch eq "\t") {
+                        $mch = "";
+                        my int $twi = 0;
+                        while ($twi < $w) {
+                            $mch = $mch . " ";
+                            $twi = $twi + 1;
+                        }
+                    }
+                    my int $scol = $mcl - $SX;
+                    if ($scol >= 0 && $scol + $w <= $COLS) {
                         my int $mrow = $msy + 1;
                         my int $mcol = $scol + 1 + $gutter;
                         $out = $out . $E . "[" . $mrow . ";" . $mcol . "H" . $hl . $mch . $rst;
                     }
-                    $mi = $mi + 1;
+                    $mcl = $mcl + $w;
+                    $bp = $nx;
                 }
             }
         }
@@ -5279,7 +5545,7 @@ func cmd_isearch() void {
         }
         if ($key eq "BACKSPACE" || $key eq "C-h") {
             if (length($query) > 0) {
-                $query = substr($query, 0, length($query) - 1);
+                $query = substr($query, 0, u8_prev($query, length($query)));
             }
             # Reset to start and search again
             $CY = $orig_cy;
@@ -5289,13 +5555,30 @@ func cmd_isearch() void {
             }
             next;
         }
-        # Printable chars
-        if (length($key) == 1) {
-            my int $code = ord($key);
-            if ($code >= 32 && $code <= 126) {
-                $query = $query . $key;
+        if ($key eq "PASTE") {
+            my str $ptxt = $PASTE_BUF;
+            $PASTE_BUF = "";
+            my int $pnl = index($ptxt, "\n");
+            if ($pnl >= 0) { $ptxt = substr($ptxt, 0, $pnl); }
+            my int $pcr = index($ptxt, "\r");
+            if ($pcr >= 0) { $ptxt = substr($ptxt, 0, $pcr); }
+            if (length($ptxt) > 0) {
+                $query = $query . $ptxt;
                 search_next($query, $dir, 0);
             }
+            next;
+        }
+        # Printable chars (ASCII or multi-byte UTF-8)
+        my int $append_ok = 0;
+        if (length($key) == 1) {
+            my int $code = ord($key);
+            if ($code >= 32 && $code <= 126) { $append_ok = 1; }
+        } elsif (length($key) > 1) {
+            if (core::get_byte($key, 0) >= 128) { $append_ok = 1; }
+        }
+        if ($append_ok == 1) {
+            $query = $query . $key;
+            search_next($query, $dir, 0);
         }
     }
 }
@@ -5405,6 +5688,7 @@ func cmd_query_replace() void {
     my str $repl = mb_read_complete_hist("Replace with: ", "", "replace");
 
     my int $count = 0;
+    my int $undo_saved = 0;
     my int $y = $CY;
     my int $x = $CX;
 
@@ -5433,6 +5717,10 @@ func cmd_query_replace() void {
             }
             if ($key eq "!") {
                 # Replace all remaining
+                if ($undo_saved == 0) {
+                    undo_save();
+                    $undo_saved = 1;
+                }
                 while ($y < line_count()) {
                     $line = get_line($y);
                     $pos = index(substr($line, $x), $search);
@@ -5457,6 +5745,10 @@ func cmd_query_replace() void {
                 return;
             }
             if ($key eq "y" || $key eq "Y") {
+                if ($undo_saved == 0) {
+                    undo_save();
+                    $undo_saved = 1;
+                }
                 my int $real_pos = $x + $pos;
                 my str $before = "";
                 if ($real_pos > 0) { $before = substr($line, 0, $real_pos); }
@@ -5480,21 +5772,82 @@ func cmd_query_replace() void {
     set_msg("Replaced " . $count . " occurrences.");
 }
 
+# Replace every match of $pattern in $line, scanning left to right.
+# replace() only handles the first match, and re-running it over its own
+# output loops forever when the replacement contains the pattern.  Instead,
+# anchor the pattern with ^(?:...) and walk the line to find each leftmost
+# match; an empty-replacement call measures the exact match length (which
+# a length diff alone can't give when $repl contains backreferences).
+func regexp_replace_all(str $line, str $pattern, str $repl) str {
+    # Patterns anchored at line start can only match once
+    if (length($pattern) > 0 && substr($pattern, 0, 1) eq "^") {
+        return replace($line, $pattern, $repl);
+    }
+    my str $anchored = "^(?:" . $pattern . ")";
+    my str $result = "";
+    my str $rest = $line;
+    my int $guard = 0;
+    while (length($rest) > 0 && $guard < 100000) {
+        $guard = $guard + 1;
+        # Fast path: no match anywhere in the remainder
+        if (replace($rest, $pattern, $repl) eq $rest) {
+            return $result . $rest;
+        }
+        # Walk forward to the leftmost match position
+        my int $matched = 0;
+        while (length($rest) > 0) {
+            my str $new_tail = replace($rest, $anchored, $repl);
+            if ($new_tail ne $rest) {
+                my str $stripped = replace($rest, $anchored, "");
+                my int $match_len = length($rest) - length($stripped);
+                my int $ins_len = length($new_tail) - length($stripped);
+                my str $inserted = "";
+                if ($ins_len > 0) { $inserted = substr($new_tail, 0, $ins_len); }
+                $result = $result . $inserted;
+                if ($match_len <= 0) {
+                    # Zero-width match: consume one char to make progress
+                    my int $nx = u8_next($rest, 0);
+                    $result = $result . substr($rest, 0, $nx);
+                    $match_len = $nx;
+                }
+                if ($match_len >= length($rest)) {
+                    return $result;
+                }
+                $rest = substr($rest, $match_len);
+                $matched = 1;
+                last;
+            }
+            # No match at this position: copy one char and advance
+            my int $nx = u8_next($rest, 0);
+            $result = $result . substr($rest, 0, $nx);
+            if ($nx >= length($rest)) {
+                return $result;
+            }
+            $rest = substr($rest, $nx);
+        }
+        if ($matched == 0) {
+            return $result . $rest;
+        }
+    }
+    return $result . $rest;
+}
+
 func cmd_replace_regexp() void {
     my str $pattern = mb_read_complete_hist("Replace regexp: ", "", "search");
     if (length($pattern) == 0) { return; }
     my str $repl = mb_read_complete_hist("Replace with: ", "", "replace");
 
     my int $count = 0;
+    my int $undo_saved = 0;
     my int $y = $CY;
     while ($y < line_count()) {
         my str $line = get_line($y);
-        my str $new_line = replace($line, $pattern, $repl);
-        while ($new_line ne $line) {
-            $line = $new_line;
-            $new_line = replace($line, $pattern, $repl);
-        }
-        if ($new_line ne get_line($y)) {
+        my str $new_line = regexp_replace_all($line, $pattern, $repl);
+        if ($new_line ne $line) {
+            if ($undo_saved == 0) {
+                undo_save();
+                $undo_saved = 1;
+            }
             set_line($y, $new_line);
             $count = $count + 1;
             $DIRTY = 1;
@@ -5519,6 +5872,10 @@ func cmd_mx() void {
     if ($cmd eq "refresh-buffer" || $cmd eq "revert-buffer") {
         if (length($FNAME) == 0) {
             set_msg("Buffer has no file.");
+            return;
+        }
+        if (file_exists($FNAME) != 1) {
+            set_msg("File no longer exists on disk: " . $FNAME);
             return;
         }
         if ($DIRTY == 1) {
@@ -5586,7 +5943,7 @@ func cmd_mx() void {
     if ($cmd eq "load-vim-syntax") {
         my str $path = mb_read("Vim syntax file: ");
         if (length($path) > 0) {
-            vim_syntax_load($path);
+            vim_syntax_load(expand_tilde($path));
         }
         return;
     }
@@ -5981,7 +6338,7 @@ func mb_read_file(str $prompt) str {
         }
         $out = $out . $disp_prompt . $disp_input;
         # Position cursor in minibuffer
-        my int $cursor_col = length($disp_prompt) + $pos + 1;
+        my int $cursor_col = length($disp_prompt) + u8_str_width(substr($input, 0, $pos)) + 1;
         if (length($input) > $avail && $avail > 3) {
             my int $skip = length($input) - $avail + 3;
             $cursor_col = length($disp_prompt) + 3 + ($pos - $skip) + 1;
@@ -6036,8 +6393,9 @@ func mb_read_file(str $prompt) str {
         }
         if ($key eq "BACKSPACE" || $key eq "C-h") {
             if ($pos > 0) {
-                $input = substr($input, 0, $pos - 1) . substr($input, $pos);
-                $pos = $pos - 1;
+                my int $pp = u8_prev($input, $pos);
+                $input = substr($input, 0, $pp) . substr($input, $pos);
+                $pos = $pp;
             }
             next;
         }
@@ -6067,15 +6425,32 @@ func mb_read_file(str $prompt) str {
             next;
         }
         if ($key eq "LEFT" || $key eq "C-b") {
-            if ($pos > 0) { $pos = $pos - 1; }
+            if ($pos > 0) { $pos = u8_prev($input, $pos); }
             next;
         }
         if ($key eq "RIGHT" || $key eq "C-f") {
-            if ($pos < length($input)) { $pos = $pos + 1; }
+            if ($pos < length($input)) { $pos = u8_next($input, $pos); }
             next;
         }
         if ($key eq "C-k") {
             $input = substr($input, 0, $pos);
+            next;
+        }
+        if ($key eq "PASTE") {
+            my str $ptxt = $PASTE_BUF;
+            $PASTE_BUF = "";
+            my int $pnl = index($ptxt, "\n");
+            if ($pnl >= 0) { $ptxt = substr($ptxt, 0, $pnl); }
+            my int $pcr = index($ptxt, "\r");
+            if ($pcr >= 0) { $ptxt = substr($ptxt, 0, $pcr); }
+            if (length($ptxt) > 0) {
+                my str $pb = "";
+                if ($pos > 0) { $pb = substr($input, 0, $pos); }
+                my str $pa = "";
+                if ($pos < length($input)) { $pa = substr($input, $pos); }
+                $input = $pb . $ptxt . $pa;
+                $pos = $pos + length($ptxt);
+            }
             next;
         }
         # History
@@ -6099,21 +6474,25 @@ func mb_read_file(str $prompt) str {
             }
             next;
         }
-        # Insert printable character
+        # Insert printable character (ASCII or multi-byte UTF-8)
+        my int $ins_ok = 0;
         if (length($key) == 1) {
             my int $code = ord($key);
-            if ($code >= 32 && $code <= 126) {
-                my str $before = "";
-                if ($pos > 0) { $before = substr($input, 0, $pos); }
-                my str $after = "";
-                if ($pos < length($input)) { $after = substr($input, $pos); }
-                $input = $before . $key . $after;
-                $pos = $pos + 1;
-                # Auto-show completions when typing after /
-                if ($key eq "/") {
-                    $show_completions = 1;
-                    $comp_scroll = 0;
-                }
+            if ($code >= 32 && $code <= 126) { $ins_ok = 1; }
+        } elsif (length($key) > 1) {
+            if (core::get_byte($key, 0) >= 128) { $ins_ok = 1; }
+        }
+        if ($ins_ok == 1) {
+            my str $before = "";
+            if ($pos > 0) { $before = substr($input, 0, $pos); }
+            my str $after = "";
+            if ($pos < length($input)) { $after = substr($input, $pos); }
+            $input = $before . $key . $after;
+            $pos = $pos + length($key);
+            # Auto-show completions when typing after /
+            if ($key eq "/") {
+                $show_completions = 1;
+                $comp_scroll = 0;
             }
         }
     }
@@ -6123,6 +6502,7 @@ func mb_read_file(str $prompt) str {
 func cmd_find_file() void {
     my str $path = mb_read_file("Find file: ");
     if (length($path) == 0) { return; }
+    $path = expand_tilde($path);
     # Strip trailing / if it's a file, not a dir
     if (length($path) > 1 && substr($path, length($path) - 1, 1) eq "/" && is_directory($path) != 1) {
         $path = substr($path, 0, length($path) - 1);
@@ -6147,7 +6527,7 @@ func cmd_find_file() void {
     # Create new buffer and open file
     buf_save_state();
     win_save_state();
-    buf_new("new", $path);
+    buf_new(path_basename($path), $path);
     buf_load_state(buf_count() - 1);
     file_open($path);
     my scalar $cw = $WINDOWS->[$WIN_IDX];
@@ -6202,9 +6582,28 @@ func cmd_kill_buffer() void {
         }
     }
     my str $killed = $BNAME;
+    my int $killed_idx = $BUF_IDX;
     splice(@$BUFFERS, $BUF_IDX, 1);
     if ($BUF_IDX >= buf_count()) {
         $BUF_IDX = buf_count() - 1;
+    }
+    # Remap window->buffer indices shifted by the splice; windows that
+    # showed the killed buffer fall back to the new current buffer
+    my int $wi = 0;
+    while ($wi < $WIN_COUNT) {
+        my scalar $w = $WINDOWS->[$wi];
+        my int $wb = $w->{"buf_idx"};
+        if ($wb == $killed_idx) {
+            $w->{"buf_idx"} = $BUF_IDX;
+            my scalar $nb = $BUFFERS->[$BUF_IDX];
+            $w->{"cy"} = $nb->{"cy"};
+            $w->{"cx"} = $nb->{"cx"};
+            $w->{"sy"} = $nb->{"sy"};
+            $w->{"sx"} = $nb->{"sx"};
+        } elsif ($wb > $killed_idx) {
+            $w->{"buf_idx"} = $wb - 1;
+        }
+        $wi = $wi + 1;
     }
     buf_load_state($BUF_IDX);
     set_msg("Killed buffer: " . $killed);
@@ -6236,7 +6635,7 @@ func handle_cx(str $key) void {
     } elsif ($key eq "C-f") {
         cmd_find_file();
     } elsif ($key eq "C-c") {
-        if ($DIRTY == 1) {
+        if (any_buffer_dirty() == 1) {
             my int $yn = mb_read_yn("Modified buffers exist; exit anyway?");
             if ($yn != 1) {
                 set_msg("Cancelled.");
@@ -6515,6 +6914,18 @@ func handle_key(str $key) void {
         $RECENTER = 0;
     }
 
+    # Track self-insert runs (undo grouping) and kill runs (C-k append):
+    # any other key ends the current run
+    my int $self_insert = 0;
+    if (length($key) == 1) {
+        my int $kc = ord($key);
+        if ($kc >= 32 && $kc <= 126) { $self_insert = 1; }
+    } elsif (length($key) > 1) {
+        if (core::get_byte($key, 0) >= 128) { $self_insert = 1; }
+    }
+    if ($self_insert == 0) { $INSERT_GROUP = 0; }
+    if ($key ne "C-k") { $LAST_KILL = 0; }
+
     # Hex mode takes over all key handling
     if ($HEX_MODE == 1) {
         hex_handle_key($key);
@@ -6583,6 +6994,12 @@ func handle_key(str $key) void {
         }
         # Any other key: dismiss and fall through
         comp_dismiss();
+    }
+
+    # Bracketed paste
+    if ($key eq "PASTE") {
+        paste_insert();
+        return;
     }
 
     # ESC as pending Meta prefix (for slow ESC + key)
@@ -6731,6 +7148,14 @@ func handle_key(str $key) void {
         }
     }
 
+    # Multi-byte UTF-8 characters
+    if (length($key) > 1) {
+        if (core::get_byte($key, 0) >= 128) {
+            edit_insert($key);
+            return;
+        }
+    }
+
     # Unknown key
     if (length($key) > 0) {
         set_msg("Unbound key: " . $key);
@@ -6748,6 +7173,9 @@ func main() int {
     $RUNNING = 1;
     $MSG = "";
     $KILL = "";
+    $LAST_KILL = 0;
+    $INSERT_GROUP = 0;
+    $PASTE_BUF = "";
     $MSET = 0;
     $DIRTY = 0;
     $FNAME = "";
@@ -6892,6 +7320,7 @@ func main() int {
     win_init();
 
     if ($argc > 0) {
+        my int $opened_first = 0;
         my int $i = 0;
         while ($i < $argc) {
             my str $path = $args[$i];
@@ -6918,13 +7347,14 @@ func main() int {
                 if ($cdot > 0) { $clang = substr($cbase, 0, $cdot); }
                 comp_load_file($cpath, $clang);
             } else {
-                if ($i == 1) {
-                    # Replace scratch buffer with first file
+                if ($opened_first == 0) {
+                    # First file replaces the scratch buffer
                     file_open($path);
+                    $opened_first = 1;
                 } else {
                     # Additional files in new buffers
                     buf_save_state();
-                    buf_new("new", $path);
+                    buf_new(path_basename($path), $path);
                     buf_load_state(buf_count() - 1);
                     file_open($path);
                 }
@@ -6937,8 +7367,8 @@ func main() int {
     my scalar $init_w = $WINDOWS->[$WIN_IDX];
     $init_w->{"buf_idx"} = $BUF_IDX;
 
-    # Enter alternate screen
-    core::write_fd(1, $E . "[?1049h");
+    # Enter alternate screen, enable bracketed paste
+    core::write_fd(1, $E . "[?1049h" . $E . "[?2004h");
 
     set_msg("smacs v0.1 - C-x C-c to quit, C-h for help, M-x for commands");
 
@@ -6954,8 +7384,8 @@ func main() int {
         }
     }
 
-    # Leave alternate screen
-    core::write_fd(1, $E . "[?1049l");
+    # Disable bracketed paste, leave alternate screen
+    core::write_fd(1, $E . "[?2004l" . $E . "[?1049l");
 
     disable_raw();
     return 0;
