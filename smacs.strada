@@ -19,7 +19,14 @@
 
 package main;
 
+use lib "lib";
+use Smacs::Text;
+use Smacs::File;
+use Smacs::Commands;
+
 our int $SIGWINCH_FLAG;    # set by SIGWINCH signal handler
+our int $EXIT_SIGNAL;      # set by INT/TERM/HUP signal handlers
+our int $TERM_ACTIVE;      # terminal is currently in raw/alternate mode
 
 # ===========================================================================
 # Global State
@@ -58,6 +65,11 @@ our str $FNAME;         # current buffer filename
 our str $BNAME;         # current buffer name
 our str $SYNTAX;        # current buffer syntax language
 our str $MODE;          # current major mode name (e.g. "Text", "Strada", "C")
+our str $FILE_EOL;      # preferred line ending for the current buffer
+our int $FILE_FINAL_NL; # buffer ends with a line ending
+our int $FILE_MTIME;    # disk fingerprint captured at open/save
+our int $FILE_SIZE;
+our int $LINES_SHARED;  # current lines are shared with an undo snapshot
 
 our scalar $VIM_SYN;    # hash ref of loaded vim syntax defs, keyed by lang
 our scalar $SYN_KEYWORDS;   # hash ref: lang -> hash ref of keyword -> color code
@@ -110,19 +122,32 @@ func winch_handler() void {
     $SIGWINCH_FLAG = 1;
 }
 
+func exit_signal_handler() void {
+    $EXIT_SIGNAL = 1;
+}
+
+func terminal_restore() void {
+    if ($TERM_ACTIVE == 0) { return; }
+    core::write_fd(1, chr(27) . "[?2004l" . chr(27) . "[?25h" . chr(27) . "[?1049l");
+    core::term_disable_raw();
+    $TERM_ACTIVE = 0;
+}
+
 func enable_raw() void {
     core::term_enable_raw();
+    $TERM_ACTIVE = 1;
     core::signal("WINCH", \&winch_handler);
+    core::signal("HUP", \&exit_signal_handler);
+    core::signal("INT", \&exit_signal_handler);
+    core::signal("TERM", \&exit_signal_handler);
 }
 
 func disable_raw() void {
-    core::term_disable_raw();
+    terminal_restore();
 }
 
 func suspend() void {
     disable_raw();
-    # Disable bracketed paste, show cursor, exit alt screen
-    core::write_fd(1, chr(27) . "[?2004l" . chr(27) . "[?25h" . chr(27) . "[?1049l");
     # Restore default SIGTSTP handler so the signal actually stops us
     core::signal("TSTP", "DEFAULT");
     # Send SIGTSTP to self
@@ -170,172 +195,67 @@ func u8_seq_len(int $b) int {
 
 # Advance past one UTF-8 character at byte position $pos in string $s
 func u8_next(str $s, int $pos) int {
-    my int $len = length($s);
-    if ($pos >= $len) { return $pos; }
-    my int $b = core::get_byte($s, $pos);
-    my int $n = $pos + u8_seq_len($b);
-    if ($n > $len) { $n = $len; }
-    return $n;
+    return Smacs::Text::next_cluster($s, $pos);
 }
 
 # Move back one UTF-8 character from byte position $pos
 func u8_prev(str $s, int $pos) int {
-    if ($pos <= 0) { return 0; }
-    $pos = $pos - 1;
-    # Skip continuation bytes (10xxxxxx = 0x80..0xBF)
-    while ($pos > 0) {
-        my int $b = core::get_byte($s, $pos);
-
-        if ($b < 128 || $b >= 192) { return $pos; }
-        $pos = $pos - 1;
-    }
-    return $pos;
+    return Smacs::Text::prev_cluster($s, $pos);
 }
 
 # Is byte at $pos a UTF-8 continuation byte?
 func u8_is_cont(str $s, int $pos) int {
-    if ($pos < 0 || $pos >= length($s)) { return 0; }
-    my int $b = core::get_byte($s, $pos);
-    if ($b >= 128 && $b < 192) { return 1; }
-    return 0;
+    return Smacs::Text::is_continuation($s, $pos);
 }
 
 # Decode the UTF-8 codepoint starting at byte position $pos
 func u8_codepoint(str $s, int $pos) int {
-    my int $b = core::get_byte($s, $pos);
-    if ($b < 128) { return $b; }
-    my int $len = length($s);
-    if ($b < 224) {
-        if ($pos + 1 >= $len) { return $b; }
-        return ($b - 192) * 64 + (core::get_byte($s, $pos + 1) - 128);
-    }
-    if ($b < 240) {
-        if ($pos + 2 >= $len) { return $b; }
-        return ($b - 224) * 4096 + (core::get_byte($s, $pos + 1) - 128) * 64 + (core::get_byte($s, $pos + 2) - 128);
-    }
-    if ($pos + 3 >= $len) { return $b; }
-    return ($b - 240) * 262144 + (core::get_byte($s, $pos + 1) - 128) * 4096 + (core::get_byte($s, $pos + 2) - 128) * 64 + (core::get_byte($s, $pos + 3) - 128);
+    return Smacs::Text::codepoint($s, $pos);
 }
 
 # Display width of the character at byte position $pos (1 or 2 for wide chars)
 func u8_char_width(str $s, int $pos) int {
-    my int $cp = u8_codepoint($s, $pos);
-    if ($cp < 128) { return 1; }
-    # CJK and wide character ranges
-    if ($cp >= 0x1100 && $cp <= 0x115F) { return 2; }
-    if ($cp >= 0x2E80 && $cp <= 0xA4CF) { return 2; }
-    if ($cp >= 0xAC00 && $cp <= 0xD7A3) { return 2; }
-    if ($cp >= 0xF900 && $cp <= 0xFAFF) { return 2; }
-    if ($cp >= 0xFE10 && $cp <= 0xFE6F) { return 2; }
-    if ($cp >= 0xFF01 && $cp <= 0xFF60) { return 2; }
-    if ($cp >= 0xFFE0 && $cp <= 0xFFE6) { return 2; }
-    if ($cp >= 0x20000 && $cp <= 0x3134F) { return 2; }
-    if ($cp >= 0x1F300 && $cp <= 0x1F9FF) { return 2; }
-    return 1;
+    return Smacs::Text::cluster_width($s, $pos);
 }
 
 # Display width of the char at byte $pos given the current display column.
 # Tabs advance to the next $TAB_WIDTH stop, so their width depends on $col.
 func char_width_at(str $s, int $pos, int $col) int {
-    my int $b = core::get_byte($s, $pos);
-    if ($b == 9) {
-        my int $tw = $TAB_WIDTH;
-        if ($tw < 1) { $tw = 1; }
-        return $tw - ($col % $tw);
-    }
-    return u8_char_width($s, $pos);
+    return Smacs::Text::char_width_at($s, $pos, $col, $TAB_WIDTH);
 }
 
 # Expand tabs to spaces using $TAB_WIDTH stops (for rendering)
 func expand_tabs(str $s) str {
-    if (index($s, "\t") < 0) { return $s; }
-    my str $out = "";
-    my int $col = 0;
-    my int $pos = 0;
-    my int $len = length($s);
-    while ($pos < $len) {
-        my int $b = core::get_byte($s, $pos);
-        if ($b == 9) {
-            my int $w = char_width_at($s, $pos, $col);
-            my int $i = 0;
-            while ($i < $w) {
-                $out = $out . " ";
-                $i = $i + 1;
-            }
-            $col = $col + $w;
-            $pos = $pos + 1;
-        } else {
-            my int $nx = u8_next($s, $pos);
-            $out = $out . substr($s, $pos, $nx - $pos);
-            $col = $col + u8_char_width($s, $pos);
-            $pos = $nx;
-        }
-    }
-    return $out;
+    return Smacs::Text::terminal_text($s, $TAB_WIDTH);
+}
+
+func terminal_safe(str $s) str {
+    return Smacs::Text::terminal_text($s, $TAB_WIDTH);
 }
 
 # Display width of a string (accounts for multi-byte, wide chars, and tabs)
 func u8_str_width(str $s) int {
-    my int $w = 0;
-    my int $pos = 0;
-    my int $len = length($s);
-    while ($pos < $len) {
-        $w = $w + char_width_at($s, $pos, $w);
-        $pos = u8_next($s, $pos);
-    }
-    return $w;
+    return Smacs::Text::display_width($s, $TAB_WIDTH);
 }
 
 # Convert byte position to display column
 func u8_byte_to_col(str $s, int $byte_pos) int {
-    my int $col = 0;
-    my int $pos = 0;
-    while ($pos < $byte_pos && $pos < length($s)) {
-        $col = $col + char_width_at($s, $pos, $col);
-        $pos = u8_next($s, $pos);
-    }
-    return $col;
+    return Smacs::Text::byte_to_col($s, $byte_pos, $TAB_WIDTH);
 }
 
 # Convert display column to byte position (returns byte pos of char at or after target col)
 func u8_col_to_byte(str $s, int $target_col) int {
-    my int $col = 0;
-    my int $pos = 0;
-    my int $len = length($s);
-    while ($pos < $len && $col < $target_col) {
-        $col = $col + char_width_at($s, $pos, $col);
-        $pos = u8_next($s, $pos);
-    }
-    return $pos;
+    return Smacs::Text::col_to_byte($s, $target_col, $TAB_WIDTH);
 }
 
 # Truncate string to fit within max_cols display columns
 func u8_truncate(str $s, int $max_cols) str {
-    my int $col = 0;
-    my int $pos = 0;
-    my int $len = length($s);
-    while ($pos < $len) {
-        my int $w = char_width_at($s, $pos, $col);
-        if ($col + $w > $max_cols) {
-            return substr($s, 0, $pos);
-        }
-        $col = $col + $w;
-        $pos = u8_next($s, $pos);
-    }
-    return $s;
+    return Smacs::Text::truncate_cols($s, $max_cols, $TAB_WIDTH);
 }
 
 # Skip $skip_cols display columns from start of $s, return remaining string
 func u8_skip_cols(str $s, int $skip_cols) str {
-    my int $col = 0;
-    my int $pos = 0;
-    my int $len = length($s);
-    while ($pos < $len && $col < $skip_cols) {
-        $col = $col + char_width_at($s, $pos, $col);
-        $pos = u8_next($s, $pos);
-    }
-    if ($pos >= $len) { return ""; }
-    return substr($s, $pos);
+    return Smacs::Text::skip_cols($s, $skip_cols, $TAB_WIDTH);
 }
 
 # ===========================================================================
@@ -593,6 +513,14 @@ func buf_new(str $name, str $filename) void {
     $buf->{"mode"} = mode_for_syntax(syn_detect($filename));
     $buf->{"undo"} = [];
     $buf->{"redo"} = [];
+    $buf->{"eol"} = "\n";
+    $buf->{"final_newline"} = 0;
+    $buf->{"disk_mtime"} = -1;
+    $buf->{"disk_size"} = -1;
+    $buf->{"generation"} = 0;
+    $buf->{"highlight_cache"} = {};
+    $buf->{"which_cache_key"} = "";
+    $buf->{"which_cache_value"} = "";
     push(@$BUFFERS, $buf);
 }
 
@@ -609,6 +537,10 @@ func buf_save_state() void {
     $buf->{"mode"} = $MODE;
     $buf->{"undo"} = $UNDO;
     $buf->{"redo"} = $REDO;
+    $buf->{"eol"} = $FILE_EOL;
+    $buf->{"final_newline"} = $FILE_FINAL_NL;
+    $buf->{"disk_mtime"} = $FILE_MTIME;
+    $buf->{"disk_size"} = $FILE_SIZE;
     $buf->{"hex_mode"} = $HEX_MODE;
     $buf->{"hex_byte_pos"} = $HEX_BYTE_POS;
     $buf->{"hex_in_ascii"} = $HEX_IN_ASCII;
@@ -636,6 +568,15 @@ func buf_load_state(int $idx) void {
     if (!defined($REDO)) {
         $REDO = [];
     }
+    $FILE_EOL = $buf->{"eol"};
+    if (length($FILE_EOL) == 0) { $FILE_EOL = "\n"; }
+    $FILE_FINAL_NL = $buf->{"final_newline"};
+    if (!defined($FILE_FINAL_NL)) { $FILE_FINAL_NL = 0; }
+    $FILE_MTIME = $buf->{"disk_mtime"};
+    if (!defined($FILE_MTIME)) { $FILE_MTIME = -1; }
+    $FILE_SIZE = $buf->{"disk_size"};
+    if (!defined($FILE_SIZE)) { $FILE_SIZE = -1; }
+    $LINES_SHARED = 0;
     $HEX_MODE = $buf->{"hex_mode"};
     if (!defined($HEX_MODE)) { $HEX_MODE = 0; }
     $HEX_BYTE_POS = $buf->{"hex_byte_pos"};
@@ -1068,19 +1009,47 @@ func get_line(int $n) str {
     return $CL->[$n];
 }
 
+func ensure_lines_writable() void {
+    if ($LINES_SHARED == 0) { return; }
+    my scalar $copy = [];
+    my int $i = 0;
+    while ($i < scalar(@$CL)) {
+        push(@$copy, $CL->[$i]);
+        $i = $i + 1;
+    }
+    $CL = $copy;
+    $BUFFERS->[$BUF_IDX]->{"lines"} = $copy;
+    $LINES_SHARED = 0;
+}
+
+func note_buffer_changed() void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my int $gen = $buf->{"generation"};
+    if (!defined($gen)) { $gen = 0; }
+    $buf->{"generation"} = $gen + 1;
+    $buf->{"highlight_cache"} = {};
+    $buf->{"which_cache_key"} = "";
+}
+
 func set_line(int $n, str $val) void {
     if ($n >= 0 && $n < scalar(@$CL)) {
+        ensure_lines_writable();
         $CL->[$n] = $val;
+        note_buffer_changed();
     }
 }
 
 func insert_line(int $at, str $val) void {
+    ensure_lines_writable();
     splice(@$CL, $at, 0, $val);
+    note_buffer_changed();
 }
 
 func delete_line(int $at) void {
     if (scalar(@$CL) > 1) {
+        ensure_lines_writable();
         splice(@$CL, $at, 1);
+        note_buffer_changed();
     }
 }
 
@@ -1089,7 +1058,7 @@ func delete_line(int $at) void {
 # ===========================================================================
 
 func set_msg(str $text) void {
-    $MSG = $text;
+    $MSG = terminal_safe($text);
 }
 
 # ===========================================================================
@@ -1122,29 +1091,32 @@ func unique_dir_part(str $filepath, str $basename) str {
 
 func file_open(str $path) void {
     my int $is_new = 0;
-    my scalar $lines = [];
-    my scalar $fh = core::open($path, "r");
-    if (!defined($fh)) {
+    my scalar $parsed = undef;
+    my scalar $data = Smacs::File::read_all($path);
+    if (!defined($data)) {
         if (file_exists($path) == 1) {
             set_msg("Cannot open: " . $path);
             return;
         }
         # File doesn't exist yet: edit an empty buffer, create on save
         $is_new = 1;
+        $parsed = Smacs::File::parse_text("");
     } else {
-        my str $line = <$fh>;
-        while (defined($line)) {
-            push(@$lines, $line);
-            $line = <$fh>;
-        }
-        core::close($fh);
+        $parsed = Smacs::File::parse_text($data);
     }
-    if (scalar(@$lines) == 0) {
-        push(@$lines, "");
-    }
+    my scalar $lines = $parsed->{"lines"};
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     $buf->{"lines"} = $lines;
+    $buf->{"generation"} = $buf->{"generation"} + 1;
+    $buf->{"highlight_cache"} = {};
+    $buf->{"which_cache_key"} = "";
     $CL = $lines;
+    $LINES_SHARED = 0;
+    $FILE_EOL = $parsed->{"eol"};
+    $FILE_FINAL_NL = $parsed->{"final_newline"};
+    my scalar $fp = Smacs::File::fingerprint($path);
+    $FILE_MTIME = $fp->{"mtime"};
+    $FILE_SIZE = $fp->{"size"};
     $CY = 0;
     $CX = 0;
     $SY = 0;
@@ -1192,11 +1164,39 @@ func file_open(str $path) void {
     $b2->{"mode"} = $MODE;
     $b2->{"filename"} = $path;
     $b2->{"syntax"} = $SYNTAX;
+    $b2->{"eol"} = $FILE_EOL;
+    $b2->{"final_newline"} = $FILE_FINAL_NL;
+    $b2->{"disk_mtime"} = $FILE_MTIME;
+    $b2->{"disk_size"} = $FILE_SIZE;
     if ($is_new == 1) {
         set_msg($path . " (New file)");
+    } elsif ($parsed->{"mixed_eol"} == 1) {
+        set_msg("Opened: " . $path . " (mixed line endings; using the dominant style on save)");
     } else {
         set_msg("Opened: " . $path);
     }
+}
+
+func file_changed_on_disk() int {
+    if (length($FNAME) == 0) { return 0; }
+    my scalar $fp = Smacs::File::fingerprint($FNAME);
+    if ($FILE_MTIME < 0) { return $fp->{"exists"}; }
+    if ($fp->{"exists"} == 0) { return 1; }
+    if ($fp->{"mtime"} != $FILE_MTIME || $fp->{"size"} != $FILE_SIZE) { return 1; }
+    return 0;
+}
+
+func refresh_disk_fingerprint() void {
+    my scalar $fp = Smacs::File::fingerprint($FNAME);
+    $FILE_MTIME = $fp->{"mtime"};
+    $FILE_SIZE = $fp->{"size"};
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"disk_mtime"} = $FILE_MTIME;
+    $buf->{"disk_size"} = $FILE_SIZE;
+}
+
+func buffer_text() str {
+    return Smacs::File::serialize($CL, $FILE_EOL, $FILE_FINAL_NL);
 }
 
 func file_save() void {
@@ -1212,19 +1212,18 @@ func file_save() void {
         }
         $FNAME = expand_tilde($path);
     }
-    my scalar $fh = core::open($FNAME, "w");
-    if (!defined($fh)) {
-        set_msg("Cannot write: " . $FNAME);
+    if (file_changed_on_disk() == 1) {
+        my int $yn = mb_read_yn("File changed on disk; overwrite?");
+        if ($yn != 1) { set_msg("Save cancelled."); return; }
+    }
+    my str $err = Smacs::File::atomic_write($FNAME, buffer_text());
+    if (length($err) > 0) {
+        set_msg($err);
         return;
     }
-    my int $i = 0;
     my int $n = line_count();
-    while ($i < $n) {
-        say($fh, get_line($i));
-        $i = $i + 1;
-    }
-    core::close($fh);
     $DIRTY = 0;
+    refresh_disk_fingerprint();
     set_msg("Wrote " . $n . " lines to " . $FNAME);
 }
 
@@ -1333,11 +1332,19 @@ func load_config() void {
     # System config
     load_config_file("/etc/smacsrc");
 
+    # A custom PREFIX install is discovered relative to PREFIX/bin/smacs.
+    my str $prefix = runtime_prefix();
+    if (length($prefix) > 0) {
+        load_config_file($prefix . "/etc/smacsrc");
+    }
+
     # User config: ~/.smacsrc
     my str $home = core::getenv("HOME");
     if (length($home) > 0) {
         load_config_file($home . "/.smacsrc");
     }
+    my str $explicit = core::getenv("SMACS_CONFIG");
+    if (length($explicit) > 0) { load_config_file(expand_tilde($explicit)); }
 }
 
 # ===========================================================================
@@ -1875,7 +1882,7 @@ func is_digit(str $ch) int {
     return ($code >= 48 && $code <= 57);
 }
 
-func highlight_line(str $line, str $lang) str {
+func highlight_line_uncached(str $line, str $lang) str {
     if (length($lang) == 0 || !defined($SYN_KEYWORDS)) {
         return $line;
     }
@@ -2039,6 +2046,17 @@ func highlight_line(str $line, str $lang) str {
         $i = $nxi;
     }
     return $out;
+}
+
+func highlight_line_cached(str $line, str $lang, int $row, int $sx, int $cols) str {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my scalar $cache = $buf->{"highlight_cache"};
+    if (!defined($cache)) { $cache = {}; $buf->{"highlight_cache"} = $cache; }
+    my str $key = $buf->{"generation"} . ":" . $row . ":" . $sx . ":" . $cols . ":" . $lang;
+    if (defined($cache->{$key})) { return $cache->{$key}; }
+    my str $colored = highlight_line_uncached($line, $lang);
+    $cache->{$key} = $colored;
+    return $colored;
 }
 
 # ===========================================================================
@@ -2902,7 +2920,7 @@ func find_matching_bracket(int $y, int $x) str {
 
 # Find the name of the function enclosing the cursor line.
 # Scans backward from $CY looking for function definition patterns.
-func which_function() str {
+func which_function_scan() str {
     if ($WHICH_FUNC == 0) { return ""; }
     my int $y = $CY;
     my int $brace_depth = 0;
@@ -3096,6 +3114,17 @@ func which_function() str {
     return "";
 }
 
+func which_function() str {
+    if ($WHICH_FUNC == 0) { return ""; }
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $key = $buf->{"generation"} . ":" . $CY . ":" . $SYNTAX;
+    if ($buf->{"which_cache_key"} eq $key) { return $buf->{"which_cache_value"}; }
+    my str $value = which_function_scan();
+    $buf->{"which_cache_key"} = $key;
+    $buf->{"which_cache_value"} = $value;
+    return $value;
+}
+
 func linum_width() int {
     if ($LINUM == 0) { return 0; }
     # Width = digits of max line number + 1 space
@@ -3124,9 +3153,9 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
     }
     # Show full path if available, otherwise buffer name
     if ($is_active == 1 && length($FNAME) > 0) {
-        $left = $left . " " . $FNAME;
+        $left = $left . " " . terminal_safe($FNAME);
     } else {
-        $left = $left . " " . $bname;
+        $left = $left . " " . terminal_safe($bname);
     }
     if ($is_active == 1) {
         my str $wf = which_function();
@@ -3143,8 +3172,8 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
         my int $display_col = u8_byte_to_col(get_line($cy), $cx) + 1;
         $right = " L" . ($cy + 1) . "/" . $lcount . " C" . $display_col . " ";
     }
-    $right = "(" . $mode . ") " . $right;
-    my int $pad = $bar_width - length($left) - length($right);
+    $right = "(" . terminal_safe($mode) . ") " . $right;
+    my int $pad = $bar_width - u8_str_width($left) - u8_str_width($right);
     if ($pad < 0) { $pad = 0; }
     $out = $out . $left;
     my int $pi = 0;
@@ -3290,7 +3319,7 @@ func render() void {
                 }
                 $display = u8_truncate($display, $text_cols);
                 if (length($SYNTAX) > 0) {
-                    $display = highlight_line($display, $SYNTAX);
+                    $display = highlight_line_cached($display, $SYNTAX, $filerow, $SX, $text_cols);
                 }
                 $row_content = $row_content . $display;
             } else {
@@ -4325,16 +4354,13 @@ func undo_save() void {
     my scalar $snap = {};
     $snap->{"cy"} = $CY;
     $snap->{"cx"} = $CX;
-    # Deep copy lines
-    my scalar $copy = [];
-    my int $i = 0;
-    my int $n = line_count();
-    while ($i < $n) {
-        push(@$copy, get_line($i));
-        $i = $i + 1;
-    }
-    $snap->{"lines"} = $copy;
+    # Persistent line arrays: snapshots share immutable line strings. The
+    # first following mutation clones only the array of references.
+    $snap->{"lines"} = $CL;
+    $snap->{"eol"} = $FILE_EOL;
+    $snap->{"final_newline"} = $FILE_FINAL_NL;
     push(@$UNDO, $snap);
+    $LINES_SHARED = 1;
     # Trim oldest entries if over limit
     while (scalar(@$UNDO) > $UNDO_MAX) {
         shift(@$UNDO);
@@ -4352,14 +4378,9 @@ func edit_undo() void {
     my scalar $rsnap = {};
     $rsnap->{"cy"} = $CY;
     $rsnap->{"cx"} = $CX;
-    my scalar $rcopy = [];
-    my int $ri = 0;
-    my int $rn = line_count();
-    while ($ri < $rn) {
-        push(@$rcopy, get_line($ri));
-        $ri = $ri + 1;
-    }
-    $rsnap->{"lines"} = $rcopy;
+    $rsnap->{"lines"} = $CL;
+    $rsnap->{"eol"} = $FILE_EOL;
+    $rsnap->{"final_newline"} = $FILE_FINAL_NL;
     push(@$REDO, $rsnap);
 
     my scalar $snap = pop(@$UNDO);
@@ -4368,6 +4389,10 @@ func edit_undo() void {
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     $buf->{"lines"} = $snap->{"lines"};
     $CL = $snap->{"lines"};
+    $FILE_EOL = $snap->{"eol"};
+    $FILE_FINAL_NL = $snap->{"final_newline"};
+    $LINES_SHARED = 0;
+    note_buffer_changed();
     $DIRTY = 1;
     set_msg("Undo.");
 }
@@ -4381,14 +4406,9 @@ func edit_redo() void {
     my scalar $usnap = {};
     $usnap->{"cy"} = $CY;
     $usnap->{"cx"} = $CX;
-    my scalar $ucopy = [];
-    my int $ui = 0;
-    my int $un = line_count();
-    while ($ui < $un) {
-        push(@$ucopy, get_line($ui));
-        $ui = $ui + 1;
-    }
-    $usnap->{"lines"} = $ucopy;
+    $usnap->{"lines"} = $CL;
+    $usnap->{"eol"} = $FILE_EOL;
+    $usnap->{"final_newline"} = $FILE_FINAL_NL;
     push(@$UNDO, $usnap);
 
     my scalar $snap = pop(@$REDO);
@@ -4397,6 +4417,10 @@ func edit_redo() void {
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     $buf->{"lines"} = $snap->{"lines"};
     $CL = $snap->{"lines"};
+    $FILE_EOL = $snap->{"eol"};
+    $FILE_FINAL_NL = $snap->{"final_newline"};
+    $LINES_SHARED = 0;
+    note_buffer_changed();
     $DIRTY = 1;
     set_msg("Redo.");
 }
@@ -4520,25 +4544,17 @@ func hex_enter_mode() void {
     $HEX_PREV_MODE = $MODE;
     $HEX_PREV_SYNTAX = $SYNTAX;
 
-    # Build raw data from buffer lines
-    my str $data = "";
-    my int $i = 0;
-    my int $n = line_count();
-    # If file is open, re-read as binary; otherwise join lines
-    if (length($FNAME) > 0) {
-        $data = core::slurp($FNAME);
-    } else {
-        while ($i < $n) {
-            if ($i > 0) {
-                $data = $data . "\n";
-            }
-            $data = $data . get_line($i);
-            $i = $i + 1;
-        }
-    }
+    # Always use the in-memory buffer. Re-reading $FNAME here used to discard
+    # unsaved text edits when entering hex mode.
+    my str $data = buffer_text();
 
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     $buf->{"hex_data"} = $data;
+    # Hex undo entries are byte deltas and intentionally start a fresh stack.
+    $UNDO = [];
+    $REDO = [];
+    $buf->{"undo"} = $UNDO;
+    $buf->{"redo"} = $REDO;
 
     $HEX_MODE = 1;
     $HEX_BYTE_POS = 0;
@@ -4560,26 +4576,20 @@ func hex_leave_mode() void {
     my str $data = $buf->{"hex_data"};
     if (!defined($data)) { $data = ""; }
 
-    # Convert binary data back to text lines (split on newlines)
-    my scalar $lines = [];
-    my str $cur = "";
-    my int $i = 0;
-    my int $total = core::byte_length($data);
-    while ($i < $total) {
-        my int $b = core::get_byte($data, $i);
-        if ($b == 10) {
-            push(@$lines, $cur);
-            $cur = "";
-        } else {
-            $cur = $cur . core::pack("C", $b);
-        }
-        $i = $i + 1;
-    }
-    push(@$lines, $cur);
+    my scalar $parsed = Smacs::File::parse_text($data);
+    my scalar $lines = $parsed->{"lines"};
 
     $buf->{"lines"} = $lines;
     $buf->{"hex_data"} = undef;
+    $buf->{"generation"} = $buf->{"generation"} + 1;
+    $buf->{"highlight_cache"} = {};
+    $buf->{"which_cache_key"} = "";
     $CL = $lines;
+    $LINES_SHARED = 0;
+    $FILE_EOL = $parsed->{"eol"};
+    $FILE_FINAL_NL = $parsed->{"final_newline"};
+    $buf->{"eol"} = $FILE_EOL;
+    $buf->{"final_newline"} = $FILE_FINAL_NL;
 
     $HEX_MODE = 0;
     $MODE = $HEX_PREV_MODE;
@@ -4636,11 +4646,12 @@ func hex_is_hex_char(str $ch) int {
 
 func hex_undo_save() void {
     my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my str $data = $buf->{"hex_data"};
+    if (!defined($data) || $HEX_BYTE_POS >= core::byte_length($data)) { return; }
     my scalar $snap = {};
-    $snap->{"cy"} = $CY;
-    $snap->{"cx"} = $CX;
-    $snap->{"hex_data"} = $buf->{"hex_data"};
     $snap->{"hex_byte_pos"} = $HEX_BYTE_POS;
+    $snap->{"hex_nibble"} = $HEX_NIBBLE;
+    $snap->{"old_byte"} = core::get_byte($data, $HEX_BYTE_POS);
     push(@$UNDO, $snap);
     while (scalar(@$UNDO) > $UNDO_MAX) {
         shift(@$UNDO);
@@ -4653,9 +4664,9 @@ func hex_undo_restore() void {
         return;
     }
     my scalar $snap = pop(@$UNDO);
-    my scalar $buf = $BUFFERS->[$BUF_IDX];
-    $buf->{"hex_data"} = $snap->{"hex_data"};
+    hex_set_byte($snap->{"hex_byte_pos"}, $snap->{"old_byte"});
     $HEX_BYTE_POS = $snap->{"hex_byte_pos"};
+    $HEX_NIBBLE = $snap->{"hex_nibble"};
     hex_rebuild_lines();
     hex_pos_to_cursor();
     $DIRTY = 1;
@@ -4815,8 +4826,14 @@ func hex_file_save() void {
     my scalar $buf = $BUFFERS->[$BUF_IDX];
     my str $data = $buf->{"hex_data"};
     if (!defined($data)) { $data = ""; }
-    core::spew($FNAME, $data);
+    if (file_changed_on_disk() == 1) {
+        my int $yn = mb_read_yn("File changed on disk; overwrite?");
+        if ($yn != 1) { set_msg("Save cancelled."); return; }
+    }
+    my str $err = Smacs::File::atomic_write($FNAME, $data);
+    if (length($err) > 0) { set_msg($err); return; }
     $DIRTY = 0;
+    refresh_disk_fingerprint();
     my int $total = core::byte_length($data);
     set_msg("Wrote " . $total . " bytes to " . $FNAME);
 }
@@ -5031,6 +5048,15 @@ func path_basename(str $path) str {
     return substr($path, $last_slash + 1);
 }
 
+func runtime_prefix() str {
+    my str $program = $0;
+    my str $real = core::realpath($program);
+    if (length($real) == 0) { return ""; }
+    my str $bindir = path_dirname($real);
+    if (path_basename($bindir) ne "bin") { return ""; }
+    return path_dirname($bindir);
+}
+
 # Find common prefix among an array of strings
 func common_prefix(array @strs) str {
     if (scalar(@strs) == 0) { return ""; }
@@ -5101,19 +5127,7 @@ func complete_buffer(str $input) array {
 
 # Get M-x command completions
 func complete_mx(str $input) array {
-    my array @cmds = ("replace-regexp", "refresh-buffer", "revert-buffer",
-        "query-replace", "replace-string", "goto-line", "set-syntax",
-        "load-vim-syntax", "load-completions", "what-cursor-position", "kill-buffer",
-        "find-file", "switch-buffer", "list-buffers",
-        "line-numbers-mode", "which-function-mode",
-        "indent-tabs-mode", "set-tab-width",
-        "tabify", "untabify", "count-words", "count-lines",
-        "fill-paragraph", "set-fill-column", "hex-mode",
-        "completion-mode", "reload-completions",
-        "text-mode", "strada-mode", "c-mode", "perl-mode",
-        "python-mode", "javascript-mode", "html-mode", "css-mode",
-        "shell-mode", "makefile-mode", "markdown-mode",
-        "comment-region", "uncomment-region");
+    my array @cmds = Smacs::Commands::mx_commands();
     my array @matches = ();
     my int $i = 0;
     while ($i < scalar(@cmds)) {
@@ -7187,6 +7201,13 @@ func main() int {
     $CX = 0;
     $MY = 0;
     $MX = 0;
+    $EXIT_SIGNAL = 0;
+    $TERM_ACTIVE = 0;
+    $FILE_EOL = "\n";
+    $FILE_FINAL_NL = 0;
+    $FILE_MTIME = -1;
+    $FILE_SIZE = -1;
+    $LINES_SHARED = 0;
 
     $UNDO = [];
     $REDO = [];
@@ -7212,7 +7233,7 @@ func main() int {
     $COMP_SCROLL = 0;
     $COMP_DEFS = {};
     $COMP_DIR = "";
-    $COMP_MODE = 1;
+    $COMP_MODE = 0;
     $HEX_MODE = 0;
     $HEX_BYTE_POS = 0;
     $HEX_IN_ASCII = 0;
@@ -7223,6 +7244,32 @@ func main() int {
     # Open files from command line args
     my array @args = core::argv();
     my int $argc = scalar(@args);
+
+    # Validate options before raw mode. -- makes all remaining arguments files.
+    my int $ci = 0;
+    my int $options_done = 0;
+    while ($ci < $argc && $options_done == 0) {
+        my str $arg = $args[$ci];
+        if ($arg eq "--") {
+            $options_done = 1;
+        } elsif ($arg eq "--help" || $arg eq "-h" || $arg eq "--version" || $arg eq "-v") {
+            $args[0] = $arg;
+            last;
+        } elsif ($arg eq "--syntax" || $arg eq "--complete") {
+            if ($ci + 1 >= $argc) {
+                say(STDERR, "smacs: " . $arg . " requires a file argument");
+                return 2;
+            }
+            $ci = $ci + 1;
+        } elsif ($arg eq "--completion-mode") {
+            # no value
+        } elsif (length($arg) > 0 && substr($arg, 0, 1) eq "-") {
+            say(STDERR, "smacs: unknown option: " . $arg);
+            say(STDERR, "Try 'smacs --help' for usage.");
+            return 2;
+        }
+        $ci = $ci + 1;
+    }
 
     # Check for --help / --version before entering TUI
     if ($argc > 0) {
@@ -7237,6 +7284,7 @@ func main() int {
             say("  --syntax FILE.vim       Load a vim syntax highlighting file");
             say("  --complete FILE.complete  Load a completion definition file");
             say("  --completion-mode       Enable code completion (M-TAB)");
+            say("  --                    Treat remaining arguments as filenames");
             say("");
             say("Configuration:");
             say("  /etc/smacsrc            System-wide config");
@@ -7256,7 +7304,7 @@ func main() int {
             return 0;
         }
         if ($args[0] eq "--version" || $args[0] eq "-v") {
-            say("smacs 0.1");
+            say("smacs " . Smacs::Commands::version());
             return 0;
         }
     }
@@ -7266,8 +7314,15 @@ func main() int {
 
     # Auto-load syntax files from standard locations (if not already loaded via config)
     if (!defined($VIM_SYN)) {
-        # Try installed location, then local dev directory
-        my array @syn_dirs = ("/usr/local/share/smacs/syntax", "/usr/share/smacs/syntax", "./syntax");
+        my array @syn_dirs = ();
+        my str $data_env = core::getenv("SMACS_DATADIR");
+        if (length($data_env) > 0) { push(@syn_dirs, expand_tilde($data_env) . "/syntax"); }
+        my str $prefix = runtime_prefix();
+        if (length($prefix) > 0) { push(@syn_dirs, $prefix . "/share/smacs/syntax"); }
+        push(@syn_dirs, "/usr/local/share/smacs/syntax");
+        push(@syn_dirs, "/usr/share/smacs/syntax");
+        # Development tree only; installed binaries do not trust the CWD.
+        if (length($prefix) == 0) { push(@syn_dirs, "./syntax"); }
         my int $sdi = 0;
         while ($sdi < scalar(@syn_dirs)) {
             my str $sd = $syn_dirs[$sdi];
@@ -7293,9 +7348,13 @@ func main() int {
         if (length($home) > 0) {
             push(@comp_dirs, $home . "/.smacs/complete");
         }
+        my str $data_env = core::getenv("SMACS_DATADIR");
+        if (length($data_env) > 0) { push(@comp_dirs, expand_tilde($data_env) . "/complete"); }
+        my str $prefix = runtime_prefix();
+        if (length($prefix) > 0) { push(@comp_dirs, $prefix . "/share/smacs/complete"); }
         push(@comp_dirs, "/usr/local/share/smacs/complete");
         push(@comp_dirs, "/usr/share/smacs/complete");
-        push(@comp_dirs, "./complete");
+        if (length($prefix) == 0) { push(@comp_dirs, "./complete"); }
         my int $cdi = 0;
         while ($cdi < scalar(@comp_dirs)) {
             my str $cd = $comp_dirs[$cdi];
@@ -7322,15 +7381,18 @@ func main() int {
     if ($argc > 0) {
         my int $opened_first = 0;
         my int $i = 0;
+        my int $positional_only = 0;
         while ($i < $argc) {
             my str $path = $args[$i];
-            if ($path eq "--completion-mode") {
+            if ($positional_only == 0 && $path eq "--") {
+                $positional_only = 1;
+            } elsif ($positional_only == 0 && $path eq "--completion-mode") {
                 $COMP_MODE = 1;
-            } elsif ($path eq "--syntax" && $i + 1 < $argc) {
+            } elsif ($positional_only == 0 && $path eq "--syntax" && $i + 1 < $argc) {
                 # --syntax file.vim
                 $i = $i + 1;
                 vim_syntax_load($args[$i]);
-            } elsif ($path eq "--complete" && $i + 1 < $argc) {
+            } elsif ($positional_only == 0 && $path eq "--complete" && $i + 1 < $argc) {
                 # --complete lang.complete
                 $i = $i + 1;
                 my str $cpath = $args[$i];
@@ -7370,10 +7432,11 @@ func main() int {
     # Enter alternate screen, enable bracketed paste
     core::write_fd(1, $E . "[?1049h" . $E . "[?2004h");
 
-    set_msg("smacs v0.1 - C-x C-c to quit, C-h for help, M-x for commands");
+    set_msg("smacs v" . Smacs::Commands::version() . " - C-x C-c to quit, C-h for help, M-x for commands");
 
     # Main loop
     while ($RUNNING == 1) {
+        if ($EXIT_SIGNAL == 1) { $RUNNING = 0; last; }
         if (check_winch() == 1) {
             update_size();
         }
@@ -7384,9 +7447,8 @@ func main() int {
         }
     }
 
-    # Disable bracketed paste, leave alternate screen
-    core::write_fd(1, $E . "[?2004l" . $E . "[?1049l");
-
     disable_raw();
     return 0;
 }
+
+END { terminal_restore(); }

@@ -1,0 +1,256 @@
+package Smacs::Text;
+
+# UTF-8 and terminal-display helpers. Cursor positions are byte offsets, but
+# movement is by extended grapheme clusters so combining marks and common emoji
+# sequences stay together.
+
+func seq_len(str $s, int $pos) int {
+    if ($pos < 0 || $pos >= length($s)) { return 1; }
+    my int $b = core::get_byte($s, $pos);
+    if ($b < 0x80) { return 1; }
+    if ($b >= 0xC2 && $b <= 0xDF) { return 2; }
+    if ($b >= 0xE0 && $b <= 0xEF) { return 3; }
+    if ($b >= 0xF0 && $b <= 0xF4) { return 4; }
+    return 1;
+}
+
+func is_continuation(str $s, int $pos) int {
+    if ($pos < 0 || $pos >= length($s)) { return 0; }
+    my int $b = core::get_byte($s, $pos);
+    return ($b >= 0x80 && $b <= 0xBF);
+}
+
+func codepoint_next(str $s, int $pos) int {
+    my int $len = length($s);
+    if ($pos >= $len) { return $len; }
+    my int $n = seq_len($s, $pos);
+    if ($pos + $n > $len) { return $pos + 1; }
+    my int $i = 1;
+    while ($i < $n) {
+        if (is_continuation($s, $pos + $i) == 0) { return $pos + 1; }
+        $i = $i + 1;
+    }
+    return $pos + $n;
+}
+
+func codepoint(str $s, int $pos) int {
+    if ($pos < 0 || $pos >= length($s)) { return 0xFFFD; }
+    my int $b0 = core::get_byte($s, $pos);
+    my int $n = seq_len($s, $pos);
+    if ($n == 1) { return $b0; }
+    if ($pos + $n > length($s)) { return 0xFFFD; }
+    my int $b1 = core::get_byte($s, $pos + 1);
+    if ($b1 < 0x80 || $b1 > 0xBF) { return 0xFFFD; }
+    if ($n == 2) { return ($b0 - 0xC0) * 64 + ($b1 - 0x80); }
+    my int $b2 = core::get_byte($s, $pos + 2);
+    if ($b2 < 0x80 || $b2 > 0xBF) { return 0xFFFD; }
+    if ($n == 3) {
+        my int $cp3 = ($b0 - 0xE0) * 4096 + ($b1 - 0x80) * 64 + ($b2 - 0x80);
+        if ($cp3 < 0x800 || ($cp3 >= 0xD800 && $cp3 <= 0xDFFF)) { return 0xFFFD; }
+        return $cp3;
+    }
+    my int $b3 = core::get_byte($s, $pos + 3);
+    if ($b3 < 0x80 || $b3 > 0xBF) { return 0xFFFD; }
+    my int $cp4 = ($b0 - 0xF0) * 262144 + ($b1 - 0x80) * 4096 + ($b2 - 0x80) * 64 + ($b3 - 0x80);
+    if ($cp4 < 0x10000 || $cp4 > 0x10FFFF) { return 0xFFFD; }
+    return $cp4;
+}
+
+func is_extend(int $cp) int {
+    if ($cp >= 0x0300 && $cp <= 0x036F) { return 1; }
+    if ($cp >= 0x1AB0 && $cp <= 0x1AFF) { return 1; }
+    if ($cp >= 0x1DC0 && $cp <= 0x1DFF) { return 1; }
+    if ($cp >= 0x20D0 && $cp <= 0x20FF) { return 1; }
+    if ($cp >= 0xFE00 && $cp <= 0xFE0F) { return 1; }
+    if ($cp >= 0xFE20 && $cp <= 0xFE2F) { return 1; }
+    if ($cp >= 0x1F3FB && $cp <= 0x1F3FF) { return 1; }
+    if ($cp >= 0xE0100 && $cp <= 0xE01EF) { return 1; }
+    return 0;
+}
+
+func is_regional(int $cp) int {
+    return ($cp >= 0x1F1E6 && $cp <= 0x1F1FF);
+}
+
+func next_cluster(str $s, int $pos) int {
+    my int $len = length($s);
+    if ($pos >= $len) { return $len; }
+    my int $first = codepoint($s, $pos);
+    my int $next = codepoint_next($s, $pos);
+
+    # Regional indicators form flag pairs.
+    if (is_regional($first) == 1 && $next < $len && is_regional(codepoint($s, $next)) == 1) {
+        $next = codepoint_next($s, $next);
+    }
+
+    while ($next < $len) {
+        my int $cp = codepoint($s, $next);
+        if (is_extend($cp) == 1) {
+            $next = codepoint_next($s, $next);
+            next;
+        }
+        # Keep ZWJ + the following base and its modifiers in this cluster.
+        if ($cp == 0x200D) {
+            $next = codepoint_next($s, $next);
+            if ($next < $len) { $next = codepoint_next($s, $next); }
+            next;
+        }
+        last;
+    }
+    return $next;
+}
+
+func prev_cluster(str $s, int $pos) int {
+    if ($pos <= 0) { return 0; }
+    if ($pos > length($s)) { $pos = length($s); }
+    my int $prev = 0;
+    my int $cur = 0;
+    while ($cur < $pos) {
+        $prev = $cur;
+        my int $next = next_cluster($s, $cur);
+        if ($next <= $cur) { return $prev; }
+        $cur = $next;
+    }
+    return $prev;
+}
+
+func is_zero_width(int $cp) int {
+    if (is_extend($cp) == 1 || $cp == 0x200D) { return 1; }
+    if ($cp == 0x200B || $cp == 0x200C || $cp == 0x2060 || $cp == 0xFEFF) { return 1; }
+    return 0;
+}
+
+func is_wide(int $cp) int {
+    if ($cp >= 0x1100 && $cp <= 0x115F) { return 1; }
+    if ($cp >= 0x2329 && $cp <= 0x232A) { return 1; }
+    if ($cp >= 0x2E80 && $cp <= 0xA4CF) { return 1; }
+    if ($cp >= 0xAC00 && $cp <= 0xD7A3) { return 1; }
+    if ($cp >= 0xF900 && $cp <= 0xFAFF) { return 1; }
+    if ($cp >= 0xFE10 && $cp <= 0xFE6F) { return 1; }
+    if ($cp >= 0xFF01 && $cp <= 0xFF60) { return 1; }
+    if ($cp >= 0xFFE0 && $cp <= 0xFFE6) { return 1; }
+    if ($cp >= 0x1F000 && $cp <= 0x1FAFF) { return 1; }
+    if ($cp >= 0x20000 && $cp <= 0x3FFFD) { return 1; }
+    return 0;
+}
+
+func cluster_width(str $s, int $pos) int {
+    my int $cp = codepoint($s, $pos);
+    if ($cp < 32 || $cp == 127) { return 2; } # rendered as caret notation
+    my int $end = next_cluster($s, $pos);
+    my int $cur = $pos;
+    my int $width = 0;
+    while ($cur < $end) {
+        my int $part = codepoint($s, $cur);
+        if (is_zero_width($part) == 0) {
+            my int $w = 1;
+            if (is_wide($part) == 1) { $w = 2; }
+            if ($w > $width) { $width = $w; }
+        }
+        $cur = codepoint_next($s, $cur);
+    }
+    return $width;
+}
+
+func char_width_at(str $s, int $pos, int $col, int $tab_width) int {
+    my int $b = core::get_byte($s, $pos);
+    if ($b == 9) {
+        if ($tab_width < 1) { $tab_width = 1; }
+        return $tab_width - ($col % $tab_width);
+    }
+    return cluster_width($s, $pos);
+}
+
+func display_width(str $s, int $tab_width) int {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < length($s)) {
+        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
+        else { $pos = next_cluster($s, $pos); }
+    }
+    return $col;
+}
+
+func byte_to_col(str $s, int $byte_pos, int $tab_width) int {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < $byte_pos && $pos < length($s)) {
+        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
+        else { $pos = next_cluster($s, $pos); }
+    }
+    return $col;
+}
+
+func col_to_byte(str $s, int $target_col, int $tab_width) int {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < length($s) && $col < $target_col) {
+        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
+        else { $pos = next_cluster($s, $pos); }
+    }
+    return $pos;
+}
+
+func truncate_cols(str $s, int $max_cols, int $tab_width) str {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < length($s)) {
+        my int $w = char_width_at($s, $pos, $col, $tab_width);
+        if ($col + $w > $max_cols) { return substr($s, 0, $pos); }
+        $col = $col + $w;
+        if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
+        else { $pos = next_cluster($s, $pos); }
+    }
+    return $s;
+}
+
+func skip_cols(str $s, int $skip_cols, int $tab_width) str {
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < length($s) && $col < $skip_cols) {
+        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
+        else { $pos = next_cluster($s, $pos); }
+    }
+    if ($pos >= length($s)) { return ""; }
+    return substr($s, $pos);
+}
+
+func caret(int $cp) str {
+    if ($cp == 127) { return "^?"; }
+    return "^" . chr($cp + 64);
+}
+
+# Expand tabs and render C0/DEL controls visibly. In particular, an ESC byte
+# from an untrusted file becomes "^[" and can never reach the terminal parser.
+func terminal_text(str $s, int $tab_width) str {
+    my str $out = "";
+    my int $col = 0;
+    my int $pos = 0;
+    while ($pos < length($s)) {
+        my int $b = core::get_byte($s, $pos);
+        if ($b == 9) {
+            my int $w = char_width_at($s, $pos, $col, $tab_width);
+            $out = $out . (" " x $w);
+            $col = $col + $w;
+            $pos = $pos + 1;
+        } else {
+            my int $cp = codepoint($s, $pos);
+            if ($cp < 32 || $cp == 127) {
+                $out = $out . caret($cp);
+                $col = $col + 2;
+                $pos = codepoint_next($s, $pos);
+            } else {
+                my int $next = next_cluster($s, $pos);
+                $out = $out . substr($s, $pos, $next - $pos);
+                $col = $col + cluster_width($s, $pos);
+                $pos = $next;
+            }
+        }
+    }
+    return $out;
+}
+

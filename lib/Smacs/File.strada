@@ -1,0 +1,193 @@
+package Smacs::File;
+
+__C__ {
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <unistd.h>
+}
+
+func read_all(str $path) scalar {
+    __C__ {
+        char *filename = strada_to_str(path);
+        FILE *fh = fopen(filename, "rb");
+        free(filename);
+        if (!fh) return strada_new_undef();
+        if (fseek(fh, 0, SEEK_END) != 0) { fclose(fh); return strada_new_undef(); }
+        long size = ftell(fh);
+        if (size < 0 || fseek(fh, 0, SEEK_SET) != 0) { fclose(fh); return strada_new_undef(); }
+        char *buf = malloc((size_t)size + 1);
+        if (!buf) { fclose(fh); return strada_new_undef(); }
+        size_t got = fread(buf, 1, (size_t)size, fh);
+        if (got < (size_t)size && ferror(fh)) { free(buf); fclose(fh); return strada_new_undef(); }
+        fclose(fh);
+        buf[got] = '\0';
+        StradaValue *result = strada_new_str_len(buf, got);
+        free(buf);
+        return result;
+    }
+}
+
+func sync_fd(int $fd) int {
+    __C__ {
+        int raw_fd = (int)strada_to_int(fd);
+        return strada_new_int(fsync(raw_fd) == 0 ? 1 : 0);
+    }
+}
+
+func dirname(str $path) str {
+    my int $slash = -1;
+    my int $i = 0;
+    while ($i < length($path)) {
+        if (substr($path, $i, 1) eq "/") { $slash = $i; }
+        $i = $i + 1;
+    }
+    if ($slash < 0) { return "."; }
+    if ($slash == 0) { return "/"; }
+    return substr($path, 0, $slash);
+}
+
+func parse_text(str $data) scalar {
+    my scalar $result = {};
+    my scalar $lines = [];
+    my int $start = 0;
+    my int $i = 0;
+    my int $crlf = 0;
+    my int $lf = 0;
+    my int $len = length($data);
+    while ($i < $len) {
+        if (core::get_byte($data, $i) == 10) {
+            my int $end = $i;
+            if ($end > $start && core::get_byte($data, $end - 1) == 13) {
+                $end = $end - 1;
+                $crlf = $crlf + 1;
+            } else {
+                $lf = $lf + 1;
+            }
+            push(@$lines, substr($data, $start, $end - $start));
+            $start = $i + 1;
+        }
+        $i = $i + 1;
+    }
+    my int $final_newline = 0;
+    if ($len > 0 && core::get_byte($data, $len - 1) == 10) {
+        $final_newline = 1;
+    } elsif ($start < $len) {
+        push(@$lines, substr($data, $start));
+    }
+    if (scalar(@$lines) == 0) { push(@$lines, ""); }
+    my str $eol = "\n";
+    if ($crlf > $lf) { $eol = "\r\n"; }
+    $result->{"lines"} = $lines;
+    $result->{"eol"} = $eol;
+    $result->{"final_newline"} = $final_newline;
+    $result->{"mixed_eol"} = ($crlf > 0 && $lf > 0);
+    return $result;
+}
+
+func serialize(scalar $lines, str $eol, int $final_newline) str {
+    if (length($eol) == 0) { $eol = "\n"; }
+    my str $out = "";
+    my int $i = 0;
+    my int $n = scalar(@$lines);
+    while ($i < $n) {
+        if ($i > 0) { $out = $out . $eol; }
+        $out = $out . $lines->[$i];
+        $i = $i + 1;
+    }
+    if ($final_newline == 1) { $out = $out . $eol; }
+    return $out;
+}
+
+func fingerprint(str $path) scalar {
+    my scalar $fp = {};
+    my scalar $st = core::stat($path);
+    if (!defined($st)) {
+        $fp->{"exists"} = 0;
+        $fp->{"mtime"} = -1;
+        $fp->{"size"} = -1;
+        return $fp;
+    }
+    $fp->{"exists"} = 1;
+    $fp->{"mtime"} = $st->{"mtime"};
+    $fp->{"size"} = $st->{"size"};
+    return $fp;
+}
+
+func error_text(str $prefix) str {
+    my int $err = core::errno();
+    if ($err > 0) { return $prefix . ": " . core::strerror($err); }
+    return $prefix;
+}
+
+# Return an empty string on success or a human-readable error on failure.
+func atomic_write(str $path, str $data) str {
+    my str $target = $path;
+    if (core::file_exists($path) == 1 && core::is_symlink($path) == 1) {
+        my str $real = core::realpath($path);
+        if (length($real) == 0) { return "Cannot resolve symlink: " . $path; }
+        $target = $real;
+    }
+
+    my scalar $old_stat = core::stat($target);
+    my int $mode = 0;
+    my int $uid = -1;
+    my int $gid = -1;
+    if (defined($old_stat)) {
+        $mode = $old_stat->{"mode"} & 07777;
+        $uid = $old_stat->{"uid"};
+        $gid = $old_stat->{"gid"};
+    } else {
+        my int $old_umask = core::umask(0);
+        core::umask($old_umask);
+        $mode = 0666 & (~$old_umask);
+    }
+
+    my scalar $created = core::mkstemp($target . ".smacs.XXXXXX");
+    if (!defined($created) || scalar(@$created) < 2) {
+        return error_text("Cannot create temporary file for " . $path);
+    }
+    my int $fd = $created->[0];
+    my str $tmp = $created->[1];
+    my scalar $fh = core::fdopen_write($fd);
+    if (!defined($fh)) {
+        core::unlink($tmp);
+        return error_text("Cannot open temporary file for " . $path);
+    }
+
+    if ($uid >= 0) { core::fchown($fd, $uid, $gid); }
+    if (core::fchmod($fd, $mode) != 0) {
+        my str $err = error_text("Cannot set permissions on temporary file");
+        core::close($fh);
+        core::unlink($tmp);
+        return $err;
+    }
+
+    print($fh, $data);
+    if (core::ferror($fh) != 0 || core::flush($fh) != 1) {
+        my str $err = error_text("Cannot write " . $path);
+        core::close($fh);
+        core::unlink($tmp);
+        return $err;
+    }
+    if (sync_fd($fd) != 1) {
+        my str $err = error_text("Cannot sync " . $path);
+        core::close($fh);
+        core::unlink($tmp);
+        return $err;
+    }
+    core::close($fh);
+
+    if (core::rename($tmp, $target) != 0) {
+        my str $err = error_text("Cannot replace " . $path);
+        core::unlink($tmp);
+        return $err;
+    }
+
+    # Persist the rename when the platform permits syncing directories.
+    my int $dirfd = core::open_fd(dirname($target), "r");
+    if ($dirfd >= 0) {
+        sync_fd($dirfd);
+        core::close_fd($dirfd);
+    }
+    return "";
+}
