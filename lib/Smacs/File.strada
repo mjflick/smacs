@@ -1,37 +1,8 @@
 package Smacs::File;
 
-__C__ {
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <unistd.h>
-}
-
+# Binary-safe (slurp preserves embedded NULs and returns undef on error).
 func read_all(str $path) scalar {
-    __C__ {
-        char *filename = strada_to_str(path);
-        FILE *fh = fopen(filename, "rb");
-        free(filename);
-        if (!fh) return strada_new_undef();
-        if (fseek(fh, 0, SEEK_END) != 0) { fclose(fh); return strada_new_undef(); }
-        long size = ftell(fh);
-        if (size < 0 || fseek(fh, 0, SEEK_SET) != 0) { fclose(fh); return strada_new_undef(); }
-        char *buf = malloc((size_t)size + 1);
-        if (!buf) { fclose(fh); return strada_new_undef(); }
-        size_t got = fread(buf, 1, (size_t)size, fh);
-        if (got < (size_t)size && ferror(fh)) { free(buf); fclose(fh); return strada_new_undef(); }
-        fclose(fh);
-        buf[got] = '\0';
-        StradaValue *result = strada_new_str_len(buf, got);
-        free(buf);
-        return result;
-    }
-}
-
-func sync_fd(int $fd) int {
-    __C__ {
-        int raw_fd = (int)strada_to_int(fd);
-        return strada_new_int(fsync(raw_fd) == 0 ? 1 : 0);
-    }
+    return slurp($path);
 }
 
 func dirname(str $path) str {
@@ -169,7 +140,7 @@ func atomic_write(str $path, str $data) str {
         core::unlink($tmp);
         return $err;
     }
-    if (sync_fd($fd) != 1) {
+    if (core::fsync($fd) != 0) {
         my str $err = error_text("Cannot sync " . $path);
         core::close($fh);
         core::unlink($tmp);
@@ -186,7 +157,7 @@ func atomic_write(str $path, str $data) str {
     # Persist the rename when the platform permits syncing directories.
     my int $dirfd = core::open_fd(dirname($target), "r");
     if ($dirfd >= 0) {
-        sync_fd($dirfd);
+        core::fsync($dirfd);
         core::close_fd($dirfd);
     }
     return "";
