@@ -165,7 +165,7 @@ func display_width(str $s, int $tab_width) int {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < length($s)) {
-        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        $col = $col + Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
         if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
         else { $pos = next_cluster($s, $pos); }
     }
@@ -176,7 +176,7 @@ func byte_to_col(str $s, int $byte_pos, int $tab_width) int {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < $byte_pos && $pos < length($s)) {
-        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        $col = $col + Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
         if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
         else { $pos = next_cluster($s, $pos); }
     }
@@ -187,7 +187,7 @@ func col_to_byte(str $s, int $target_col, int $tab_width) int {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < length($s) && $col < $target_col) {
-        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        $col = $col + Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
         if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
         else { $pos = next_cluster($s, $pos); }
     }
@@ -198,7 +198,7 @@ func truncate_cols(str $s, int $max_cols, int $tab_width) str {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < length($s)) {
-        my int $w = char_width_at($s, $pos, $col, $tab_width);
+        my int $w = Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
         if ($col + $w > $max_cols) { return substr($s, 0, $pos); }
         $col = $col + $w;
         if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
@@ -211,7 +211,7 @@ func skip_cols(str $s, int $skip_cols, int $tab_width) str {
     my int $col = 0;
     my int $pos = 0;
     while ($pos < length($s) && $col < $skip_cols) {
-        $col = $col + char_width_at($s, $pos, $col, $tab_width);
+        $col = $col + Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
         if (core::get_byte($s, $pos) == 9) { $pos = $pos + 1; }
         else { $pos = next_cluster($s, $pos); }
     }
@@ -233,7 +233,7 @@ func terminal_text(str $s, int $tab_width) str {
     while ($pos < length($s)) {
         my int $b = core::get_byte($s, $pos);
         if ($b == 9) {
-            my int $w = char_width_at($s, $pos, $col, $tab_width);
+            my int $w = Smacs::Text::char_width_at($s, $pos, $col, $tab_width);
             $out = $out . (" " x $w);
             $col = $col + $w;
             $pos = $pos + 1;
@@ -253,4 +253,3 @@ func terminal_text(str $s, int $tab_width) str {
     }
     return $out;
 }
-

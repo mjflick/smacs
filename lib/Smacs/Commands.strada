@@ -1,6 +1,6 @@
 package Smacs::Commands;
 
-func version() str { return "0.2.0"; }
+func release_version() str { return "0.2.0"; }
 
 func mx_commands() array {
     return ("replace-regexp", "refresh-buffer", "revert-buffer",
@@ -15,4 +15,3 @@ func mx_commands() array {
         "javascript-mode", "html-mode", "css-mode", "shell-mode",
         "makefile-mode", "markdown-mode", "comment-region", "uncomment-region");
 }
-

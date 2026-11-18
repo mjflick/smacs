@@ -4530,7 +4530,7 @@ func hex_pos_to_cursor() void {
     $CY = $row;
     if ($HEX_IN_ASCII == 1) {
         # ASCII area: offset(8) + 2 + hex_area(49) + 1 + pipe(1) = 61, then col_in_row
-        $CX = 61 + col_in_row;
+        $CX = 61 + $col_in_row;
     } else {
         # Hex area: offset(8) + 2 = 10, each byte is 3 chars, extra space after byte 7
         my int $extra = 0;
@@ -7304,7 +7304,7 @@ func main() int {
             return 0;
         }
         if ($args[0] eq "--version" || $args[0] eq "-v") {
-            say("smacs " . Smacs::Commands::version());
+            say("smacs " . Smacs::Commands::release_version());
             return 0;
         }
     }
@@ -7432,7 +7432,7 @@ func main() int {
     # Enter alternate screen, enable bracketed paste
     core::write_fd(1, $E . "[?1049h" . $E . "[?2004h");
 
-    set_msg("smacs v" . Smacs::Commands::version() . " - C-x C-c to quit, C-h for help, M-x for commands");
+    set_msg("smacs v" . Smacs::Commands::release_version() . " - C-x C-c to quit, C-h for help, M-x for commands");
 
     # Main loop
     while ($RUNNING == 1) {
