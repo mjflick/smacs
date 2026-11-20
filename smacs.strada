@@ -110,6 +110,7 @@ our scalar $LF_STATE;           # Smacs::LargeFile state hash for current buffer
 our int $LARGE_FILE_THRESHOLD;  # auto-enable threshold in bytes (default 16 MB; 0 = manual)
 our int $LARGE_CHUNK_SIZE;      # chunk window size in bytes (default 1 MB)
 our int $FORCE_LARGE_OPEN;      # 1 to force large-file mode on next open
+our scalar $KEY_QUEUE;          # unread key queue preserved across nonblocking cancel checks
 
 our scalar $WINDOWS;    # array ref of window hashes
 our int $WIN_IDX;       # active window index
@@ -315,7 +316,7 @@ func read_paste() str {
     return "PASTE";
 }
 
-func read_key() str {
+func read_key_raw() str {
     my int $c = read_byte();
     if ($c == -1) {
         return "";
@@ -470,6 +471,21 @@ func read_key() str {
         return $result;
     }
     return "";
+}
+
+func read_key() str {
+    if (defined($KEY_QUEUE) && scalar(@$KEY_QUEUE) > 0) {
+        return shift(@$KEY_QUEUE);
+    }
+    return read_key_raw();
+}
+
+func stdin_has_pending() int {
+    if (defined($KEY_QUEUE) && scalar(@$KEY_QUEUE) > 0) { return 1; }
+    my array @fds = (0);
+    my scalar $rdy = core::select_fds(\@fds, 0);
+    if (defined($rdy) && scalar(@$rdy) > 0) { return 1; }
+    return 0;
 }
 
 # Block until a key is pressed, handling SIGWINCH and exit signals cleanly.
@@ -1447,9 +1463,13 @@ func lf_progress_callback(int $pos, int $tot) int {
         my array @fds = (0);
         my scalar $rdy = core::select_fds(\@fds, 0);
         if (defined($rdy) && scalar(@$rdy) > 0) {
-            my str $k = read_key();
+            my str $k = read_key_raw();
             if ($k eq "C-g") {
+                $KEY_QUEUE = [];
                 return 1;
+            }
+            if (length($k) > 0) {
+                push(@$KEY_QUEUE, $k);
             }
         }
     }
@@ -3910,7 +3930,13 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
         my int $tot = Smacs::LargeFile::total_size($LF_STATE);
         my int $voff = Smacs::LargeFile::cursor_virtual_offset($LF_STATE, $CL, $cy, $cx);
         my int $pct = 0;
-        if ($tot > 0) { $pct = int(($voff * 100) / $tot); }
+        if ($tot > 0) {
+            if ($LF_STATE->{"chunk_vend"} >= $tot && $cy >= $lcount - 1 && $cx >= length(get_line($cy))) {
+                $pct = 100;
+            } else {
+                $pct = int(($voff * 100) / $tot);
+            }
+        }
         my int $display_col_lf = u8_byte_to_col(get_line($cy), $cx) + 1;
         $right = " @" . Smacs::LargeFile::format_bytes($voff) . "/" . Smacs::LargeFile::format_bytes($tot) . " (" . $pct . "%) L" . ($cy + 1) . "/" . $lcount . " C" . $display_col_lf . " ";
     } else {
@@ -6681,6 +6707,23 @@ func cmd_isearch(int $init_dir) void {
         if ($append_ok == 1) {
             my int $was_failing = ($status == 0 && length($query) > 0);
             $query = $query . $key;
+            # Coalesce rapid/buffered printable characters in Large File Mode so fast typing
+            # doesn't trigger redundant multi-GB disk scans on every intermediate character.
+            if ($LARGE_MODE == 1) {
+                while (stdin_has_pending() == 1) {
+                    my str $nk = read_key();
+                    if (length($nk) == 0) { last; }
+                    my int $nk_print = 0;
+                    if (length($nk) == 1 && ord($nk) >= 32 && ord($nk) <= 126) { $nk_print = 1; }
+                    elsif (length($nk) > 1 && core::get_byte($nk, 0) >= 128) { $nk_print = 1; }
+                    if ($nk_print == 1) {
+                        $query = $query . $nk;
+                    } else {
+                        unshift(@$KEY_QUEUE, $nk);
+                        last;
+                    }
+                }
+            }
             if ($was_failing == 0) {
                 $status = search_next($query, $dir, 0);
             }
@@ -6960,7 +7003,7 @@ func cmd_query_replace() void {
                     render();
                     my str $out = render_match_highlight($CY, $CX, length($search));
                     $out = $out . $E . "[" . $ROWS . ";1H" . $E . "[K";
-                    $out = $out . "Replace? (y/n/!/q) ";
+                    $out = $out . "Replace? (y/n/./!/q) ";
                     core::write_fd(1, $out);
                     $key = wait_key();
                 }
@@ -6975,7 +7018,7 @@ func cmd_query_replace() void {
                     set_msg("Replaced " . $count . " occurrences.");
                     return;
                 }
-                if ($key eq "y" || $key eq "Y" || $key eq " ") {
+                if ($key eq "y" || $key eq "Y" || $key eq " " || $key eq ".") {
                     if ($undo_saved == 0) {
                         undo_save();
                         $undo_saved = 1;
@@ -6992,6 +7035,11 @@ func cmd_query_replace() void {
                     $CX = $x;
                     $count = $count + 1;
                     $DIRTY = 1;
+                    if ($key eq ".") {
+                        if ($LARGE_MODE == 1) { lf_sync_active_chunk(); }
+                        set_msg("Replaced " . $count . " occurrences.");
+                        return;
+                    }
                 } else {
                     # Skip (n, DEL, Backspace, or anything else)
                     $x = $x + $pos + length($search);
@@ -7004,6 +7052,18 @@ func cmd_query_replace() void {
 
         if ($LARGE_MODE == 1 && defined($LF_STATE)) {
             lf_sync_active_chunk();
+            # If user already queued a quit key (e.g. typed 'yq' quickly), honor it immediately
+            # without scanning remaining gigabytes or leaking 'q' into the buffer.
+            if (stdin_has_pending() == 1) {
+                my str $pk = read_key();
+                if ($pk eq "q" || $pk eq "C-g" || $pk eq "ESC" || $pk eq "RET") {
+                    set_msg("Replaced " . $count . " occurrences.");
+                    return;
+                }
+                if (length($pk) > 0) {
+                    unshift(@$KEY_QUEUE, $pk);
+                }
+            }
             my int $vend = $LF_STATE->{"chunk_vend"};
             my int $tot = Smacs::LargeFile::total_size($LF_STATE);
             if ($vend >= $tot) { last; }
@@ -8761,6 +8821,7 @@ func main() int {
     $LARGE_FILE_THRESHOLD = 16777216; # 16 MB auto-enable threshold
     $LARGE_CHUNK_SIZE = 1048576;      # 1 MB chunk window
     $FORCE_LARGE_OPEN = 0;
+    $KEY_QUEUE = [];
 
     # Open files from command line args
     my array @args = core::argv();

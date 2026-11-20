@@ -17,6 +17,7 @@ make install    # Install to /usr/local (or PREFIX=/path make install)
 smacs                           # Open with scratch buffer
 smacs file.txt                  # Open a file
 smacs file1.txt file2.txt       # Open multiple files
+smacs -L dump.sql               # Open in chunked Large File Mode (auto >= 16 MB)
 smacs --syntax lang.vim file.c  # Load a vim syntax file
 ```
 
@@ -41,6 +42,8 @@ is `key = value`, one per line. Lines starting with `#` are comments.
 | `syntax-ext` | ext:lang | - | Map a file extension to a language |
 | `completion-mode` | `on`/`off` | `off` | Enable code completion (M-TAB) |
 | `complete-dir` | path | `~/.smacs/complete` | Directory of `.complete` autocomplete files |
+| `large-file-threshold` | size (`16M`, `0`) | `16M` | Auto-enable Large File Mode at/above size (`0` disables) |
+| `large-file-chunk-size` | size (`1M`, `4M`) | `1M` | Chunk window size in Large File Mode |
 
 ### Example ~/.smacsrc
 
@@ -282,6 +285,24 @@ restores the original cursor position.
 `count-words`, `count-lines`, `revert-buffer`, `set-syntax`,
 `load-vim-syntax`, `what-cursor-position`, `line-numbers-mode`,
 `which-function-mode`, `hex-mode`
+
+### Large File Mode
+
+Files at or above `large-file-threshold` (default `16M`), or opened with `-L` /
+`--large` or `M-x find-file-large`, open in **Large File Mode** (`(SQL/Large)`
+etc. in the status bar). Only one line-aligned chunk (default `1M`) is loaded
+into memory at a time; untouched regions stay on disk via a span table, while
+modified chunks are tracked in memory and streamed atomically on `C-x C-s` in
+4 MB blocks so multi-gigabyte SQL dumps and logs can be searched, edited, and
+saved with minimal RAM.
+
+- Moving past the top/bottom of a chunk (`UP`/`DOWN`/`PGUP`/`PGDN`) or pressing
+  `C-x [` / `C-x ]` seamlessly loads the previous/next chunk.
+- `M-<` and `M->` jump to the start/end of the file in O(1); `M-g` accepts
+  percentages (`50%`), byte offsets (`@1048576`, `500M`, `2G`, `0x1000`), or
+  chunk line numbers.
+- `C-s`, `C-r`, `M-%` (`query-replace`), and `M-x large-replace-all` stream
+  across the entire file (press `C-g` to cancel a long scan).
 
 ### Hex Mode
 

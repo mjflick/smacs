@@ -3,6 +3,7 @@ smacs(1) -- lightweight Emacs-like text editor
 # SYNOPSIS
 
 `smacs` [*file* ...]
+`smacs` [`-L` | `--large`] [`--chunk-size` *size*] [*file* ...]
 `smacs` [`--syntax` *file.vim*] [*file* ...]
 
 # DESCRIPTION
@@ -19,6 +20,12 @@ incremental search, syntax highlighting, and a hex editing mode.
 
 `--syntax` *file.vim*
 : Load a vim syntax file for additional syntax highlighting.
+
+`-L`, `--large`
+: Open files in chunked Large File Mode without reading the entire file into memory.
+
+`--chunk-size` *size*
+: Set chunk window size for Large File Mode (e.g. `512K`, `1M`, `4M`). Default: `1M`.
 
 # CONFIGURATION
 
@@ -45,6 +52,12 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 
 `which-function-mode` = `on` | `off`
 : Show current function name in the status bar. Default: `on`.
+
+`large-file-threshold` = *size*
+: Automatically open files at or above *size* in Large File Mode (`0` disables). Default: `16M`.
+
+`large-file-chunk-size` = *size*
+: Chunk window size in Large File Mode. Default: `1M`.
 
 ## Code Completion Options
 
