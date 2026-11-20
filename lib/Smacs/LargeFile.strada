@@ -1,0 +1,800 @@
+package Smacs::LargeFile;
+
+use Smacs::File;
+
+# Piece-table / span-backed large-file engine for multi-gigabyte files.
+# Untouched regions stay on disk as { kind => "disk", offset => int, length => int }
+# descriptors (~64 bytes each regardless of gigabyte span size); only modified
+# chunks become { kind => "mem", data => str, length => int } spans in RAM.
+
+func parse_size_spec(str $spec) int {
+    my str $s = trim($spec);
+    if (length($s) == 0) { return -1; }
+    if (substr($s, 0, 1) eq "@") {
+        $s = trim(substr($s, 1));
+    }
+    if (length($s) == 0) { return -1; }
+
+    # Hex offset: 0x...
+    if (length($s) > 2 && (substr($s, 0, 2) eq "0x" || substr($s, 0, 2) eq "0X")) {
+        my int $val = 0;
+        my int $hi = 2;
+        while ($hi < length($s)) {
+            my int $b = core::get_byte($s, $hi);
+            my int $d = -1;
+            if ($b >= 48 && $b <= 57) { $d = $b - 48; }
+            elsif ($b >= 65 && $b <= 70) { $d = $b - 55; }
+            elsif ($b >= 97 && $b <= 102) { $d = $b - 87; }
+            else { return -1; }
+            $val = $val * 16 + $d;
+            $hi = $hi + 1;
+        }
+        return $val;
+    }
+
+    # Optional unit suffix: B, K/KB, M/MB, G/GB, T/TB
+    my int $mult = 1;
+    my int $slen = length($s);
+    if ($slen >= 2) {
+        my str $last2 = uc(substr($s, $slen - 2, 2));
+        if ($last2 eq "KB") { $mult = 1024; $s = trim(substr($s, 0, $slen - 2)); }
+        elsif ($last2 eq "MB") { $mult = 1048576; $s = trim(substr($s, 0, $slen - 2)); }
+        elsif ($last2 eq "GB") { $mult = 1073741824; $s = trim(substr($s, 0, $slen - 2)); }
+        elsif ($last2 eq "TB") { $mult = 1099511627776; $s = trim(substr($s, 0, $slen - 2)); }
+    }
+    if ($mult == 1 && length($s) >= 1) {
+        my str $last1 = uc(substr($s, length($s) - 1, 1));
+        if ($last1 eq "B") { $mult = 1; $s = trim(substr($s, 0, length($s) - 1)); }
+        elsif ($last1 eq "K") { $mult = 1024; $s = trim(substr($s, 0, length($s) - 1)); }
+        elsif ($last1 eq "M") { $mult = 1048576; $s = trim(substr($s, 0, length($s) - 1)); }
+        elsif ($last1 eq "G") { $mult = 1073741824; $s = trim(substr($s, 0, length($s) - 1)); }
+        elsif ($last1 eq "T") { $mult = 1099511627776; $s = trim(substr($s, 0, length($s) - 1)); }
+    }
+    if (length($s) == 0) { return -1; }
+
+    # Allow integer or decimal number (e.g. 1.5G)
+    my int $dot_seen = 0;
+    my int $int_part = 0;
+    my int $frac_num = 0;
+    my int $frac_den = 1;
+    my int $i = 0;
+    while ($i < length($s)) {
+        my int $c = core::get_byte($s, $i);
+        if ($c == 46) {
+            if ($dot_seen == 1) { return -1; }
+            $dot_seen = 1;
+        } elsif ($c >= 48 && $c <= 57) {
+            if ($dot_seen == 0) {
+                $int_part = $int_part * 10 + ($c - 48);
+            } elsif ($frac_den < 1000000) {
+                $frac_num = $frac_num * 10 + ($c - 48);
+                $frac_den = $frac_den * 10;
+            }
+        } else {
+            return -1;
+        }
+        $i = $i + 1;
+    }
+    if ($dot_seen == 0) {
+        return $int_part * $mult;
+    }
+    return $int_part * $mult + int(($frac_num * $mult) / $frac_den);
+}
+
+func format_bytes(int $bytes) str {
+    if ($bytes < 1024) {
+        return $bytes . "B";
+    }
+    if ($bytes < 1048576) {
+        my int $t = int(($bytes * 10 + 512) / 1024);
+        return int($t / 10) . "." . ($t % 10) . "K";
+    }
+    if ($bytes < 1073741824) {
+        my int $t = int(($bytes * 10 + 524288) / 1048576);
+        return int($t / 10) . "." . ($t % 10) . "M";
+    }
+    my int $g = int(($bytes * 10 + 536870912) / 1073741824);
+    return int($g / 10) . "." . ($g % 10) . "G";
+}
+
+func make_disk_span(int $offset, int $len) scalar {
+    my scalar $sp = {};
+    $sp->{"kind"} = "disk";
+    $sp->{"offset"} = $offset;
+    $sp->{"length"} = $len;
+    return $sp;
+}
+
+func make_mem_span(str $data) scalar {
+    my int $blen = core::byte_length($data);
+    my str $raw = core::byte_substr($data, 0, $blen);
+    my scalar $sp = {};
+    $sp->{"kind"} = "mem";
+    $sp->{"data"} = $raw;
+    $sp->{"length"} = $blen;
+    return $sp;
+}
+
+func create(str $path, int $disk_size, int $chunk_target) scalar {
+    if ($chunk_target < 4096) { $chunk_target = 1048576; }
+    my scalar $lf = {};
+    my scalar $spans = [];
+    if ($disk_size > 0) {
+        push(@$spans, make_disk_span(0, $disk_size));
+    }
+    $lf->{"source_path"} = $path;
+    $lf->{"chunk_target"} = $chunk_target;
+    $lf->{"spans"} = $spans;
+    $lf->{"chunk_vstart"} = 0;
+    $lf->{"chunk_vend"} = 0;
+    $lf->{"chunk_orig_bytes"} = "";
+    $lf->{"chunk_eol"} = "\n";
+    $lf->{"chunk_final_nl"} = 0;
+    $lf->{"has_edits"} = 0;
+    return $lf;
+}
+
+func total_size(scalar $lf) int {
+    if (!defined($lf)) { return 0; }
+    my scalar $spans = $lf->{"spans"};
+    my int $sum = 0;
+    my int $i = 0;
+    my int $n = scalar(@$spans);
+    while ($i < $n) {
+        $sum = $sum + $spans->[$i]->{"length"};
+        $i = $i + 1;
+    }
+    return $sum;
+}
+
+func read_range_fh(scalar $lf, scalar $fh, int $vstart, int $len) str {
+    if ($len <= 0) { return ""; }
+    if ($vstart < 0) {
+        $len = $len + $vstart;
+        $vstart = 0;
+        if ($len <= 0) { return ""; }
+    }
+    my int $vend = $vstart + $len;
+    my scalar $spans = $lf->{"spans"};
+    my int $cur = 0;
+    my str $out = "";
+    my int $parts = 0;
+    my int $i = 0;
+    my int $n = scalar(@$spans);
+    while ($i < $n) {
+        my scalar $sp = $spans->[$i];
+        my int $slen = $sp->{"length"};
+        my int $send = $cur + $slen;
+        if ($cur >= $vend) { last; }
+        if ($send > $vstart) {
+            my int $ov_s = $vstart;
+            if ($cur > $ov_s) { $ov_s = $cur; }
+            my int $ov_e = $vend;
+            if ($send < $ov_e) { $ov_e = $send; }
+            my int $rel = $ov_s - $cur;
+            my int $take = $ov_e - $ov_s;
+            if ($take > 0) {
+                my str $piece = "";
+                if ($sp->{"kind"} eq "disk") {
+                    if (defined($fh)) {
+                        core::seek($fh, $sp->{"offset"} + $rel, 0);
+                        my scalar $rd = core::fread($fh, $take);
+                        if (defined($rd)) { $piece = $rd; }
+                    }
+                } else {
+                    $piece = core::byte_substr($sp->{"data"}, $rel, $take);
+                }
+                if ($parts == 0) {
+                    $out = $piece;
+                } else {
+                    $out = $out . $piece;
+                }
+                $parts = $parts + 1;
+            }
+        }
+        $cur = $send;
+        $i = $i + 1;
+    }
+    if ($parts > 1) {
+        $out = core::byte_substr($out, 0, core::byte_length($out));
+    }
+    return $out;
+}
+
+func read_range(scalar $lf, int $vstart, int $len) str {
+    if ($len <= 0) { return ""; }
+    my scalar $fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $fh = core::open($src, "r");
+    }
+    my str $res = read_range_fh($lf, $fh, $vstart, $len);
+    if (defined($fh)) {
+        core::close($fh);
+    }
+    return $res;
+}
+
+func sub_span(scalar $sp, int $rel_start, int $sub_len) scalar {
+    if ($sp->{"kind"} eq "disk") {
+        return make_disk_span($sp->{"offset"} + $rel_start, $sub_len);
+    }
+    return make_mem_span(core::byte_substr($sp->{"data"}, $rel_start, $sub_len));
+}
+
+func coalesce_spans(scalar $spans) scalar {
+    my scalar $merged = [];
+    my int $i = 0;
+    my int $n = scalar(@$spans);
+    while ($i < $n) {
+        my scalar $sp = $spans->[$i];
+        if ($sp->{"length"} <= 0) {
+            $i = $i + 1;
+            next;
+        }
+        my int $mcount = scalar(@$merged);
+        if ($mcount > 0) {
+            my scalar $prev = $merged->[$mcount - 1];
+            if ($prev->{"kind"} eq "disk" && $sp->{"kind"} eq "disk") {
+                if ($prev->{"offset"} + $prev->{"length"} == $sp->{"offset"}) {
+                    $prev->{"length"} = $prev->{"length"} + $sp->{"length"};
+                    $i = $i + 1;
+                    next;
+                }
+            } elsif ($prev->{"kind"} eq "mem" && $sp->{"kind"} eq "mem") {
+                if ($prev->{"length"} + $sp->{"length"} <= 2097152) {
+                    my str $joined = $prev->{"data"} . $sp->{"data"};
+                    my int $jlen = core::byte_length($joined);
+                    $prev->{"data"} = core::byte_substr($joined, 0, $jlen);
+                    $prev->{"length"} = $jlen;
+                    $i = $i + 1;
+                    next;
+                }
+            }
+        }
+        push(@$merged, $sp);
+        $i = $i + 1;
+    }
+    return $merged;
+}
+
+func replace_range(scalar $lf, int $vstart, int $vend, str $new_bytes) void {
+    my int $tot = total_size($lf);
+    if ($vstart < 0) { $vstart = 0; }
+    if ($vend < $vstart) { $vend = $vstart; }
+    if ($vstart > $tot) { $vstart = $tot; }
+    if ($vend > $tot) { $vend = $tot; }
+
+    my scalar $old_spans = $lf->{"spans"};
+    my scalar $out = [];
+    my int $cur = 0;
+    my int $inserted = 0;
+    my int $new_blen = core::byte_length($new_bytes);
+
+    my int $i = 0;
+    my int $n = scalar(@$old_spans);
+    while ($i < $n) {
+        my scalar $sp = $old_spans->[$i];
+        my int $slen = $sp->{"length"};
+        my int $send = $cur + $slen;
+
+        if ($send <= $vstart) {
+            push(@$out, $sp);
+        } elsif ($cur >= $vend) {
+            if ($inserted == 0) {
+                if ($new_blen > 0) {
+                    push(@$out, make_mem_span($new_bytes));
+                }
+                $inserted = 1;
+            }
+            push(@$out, $sp);
+        } else {
+            # Overlaps [$vstart, $vend)
+            if ($cur < $vstart) {
+                push(@$out, sub_span($sp, 0, $vstart - $cur));
+            }
+            if ($inserted == 0) {
+                if ($new_blen > 0) {
+                    push(@$out, make_mem_span($new_bytes));
+                }
+                $inserted = 1;
+            }
+            if ($send > $vend) {
+                push(@$out, sub_span($sp, $vend - $cur, $send - $vend));
+            }
+        }
+        $cur = $send;
+        $i = $i + 1;
+    }
+
+    if ($inserted == 0 && $new_blen > 0) {
+        push(@$out, make_mem_span($new_bytes));
+    }
+
+    $lf->{"spans"} = coalesce_spans($out);
+    $lf->{"has_edits"} = 1;
+}
+
+# Find virtual offset of the start of the line containing $voff (immediately after '\n', or 0).
+func find_line_start_fh(scalar $lf, scalar $fh, int $voff) int {
+    if ($voff <= 0) { return 0; }
+    my int $tot = total_size($lf);
+    if ($voff > $tot) { $voff = $tot; }
+
+    my int $step = 262144; # 256 KB backward scan step
+    my int $max_scan = 33554432; # 32 MB cap for pathological newline-free blobs
+    my int $scanned = 0;
+    my int $pos = $voff;
+    while ($pos > 0 && $scanned < $max_scan) {
+        my int $rstart = $pos - $step;
+        if ($rstart < 0) { $rstart = 0; }
+        my int $rlen = $pos - $rstart;
+        my str $blk = read_range_fh($lf, $fh, $rstart, $rlen);
+        my int $blen = core::byte_length($blk);
+        my int $bi = $blen - 1;
+        while ($bi >= 0) {
+            if (core::get_byte($blk, $bi) == 10) {
+                return $rstart + $bi + 1;
+            }
+            $bi = $bi - 1;
+        }
+        $scanned = $scanned + $rlen;
+        $pos = $rstart;
+    }
+    return $pos;
+}
+
+# Find virtual offset immediately AFTER the next '\n' at or after $voff (or $tot at EOF).
+func find_line_end_fh(scalar $lf, scalar $fh, int $voff) int {
+    my int $tot = total_size($lf);
+    if ($voff >= $tot) { return $tot; }
+    if ($voff < 0) { $voff = 0; }
+
+    my int $step = 262144; # 256 KB forward scan step
+    my int $max_scan = 33554432; # 32 MB cap
+    my int $scanned = 0;
+    my int $pos = $voff;
+    while ($pos < $tot && $scanned < $max_scan) {
+        my int $rlen = $step;
+        if ($pos + $rlen > $tot) { $rlen = $tot - $pos; }
+        my str $blk = read_range_fh($lf, $fh, $pos, $rlen);
+        my int $nl = index($blk, "\n");
+        if ($nl >= 0) {
+            return $pos + $nl + 1;
+        }
+        $pos = $pos + $rlen;
+        $scanned = $scanned + $rlen;
+    }
+    return $pos;
+}
+
+# Finalize chunk [$vstart, $vend) into $lf and return parsed chunk info:
+# { lines, eol, final_newline, focus_line, focus_col }
+func build_chunk_result(scalar $lf, scalar $fh, int $vstart, int $vend, int $focus_voff) scalar {
+    my str $raw = read_range_fh($lf, $fh, $vstart, $vend - $vstart);
+    my scalar $parsed = Smacs::File::parse_text($raw);
+    $lf->{"chunk_vstart"} = $vstart;
+    $lf->{"chunk_vend"} = $vend;
+    $lf->{"chunk_orig_bytes"} = $raw;
+    $lf->{"chunk_eol"} = $parsed->{"eol"};
+    $lf->{"chunk_final_nl"} = $parsed->{"final_newline"};
+
+    # Compute cursor (line, byte_col) inside parsed lines corresponding to $focus_voff
+    my int $rel = $focus_voff - $vstart;
+    if ($rel < 0) { $rel = 0; }
+    my int $raw_len = core::byte_length($raw);
+    if ($rel > $raw_len) { $rel = $raw_len; }
+
+    my int $cy = 0;
+    my int $line_start_rel = 0;
+    my int $i = 0;
+    while ($i < $rel) {
+        if (core::get_byte($raw, $i) == 10) {
+            $cy = $cy + 1;
+            $line_start_rel = $i + 1;
+        }
+        $i = $i + 1;
+    }
+    my scalar $lines = $parsed->{"lines"};
+    my int $lcount = scalar(@$lines);
+    if ($cy >= $lcount) {
+        $cy = $lcount - 1;
+        $line_start_rel = $rel;
+    }
+    my int $cx = $rel - $line_start_rel;
+    my int $max_cx = length($lines->[$cy]);
+    if ($cx > $max_cx) { $cx = $max_cx; }
+    if ($cx < 0) { $cx = 0; }
+
+    $parsed->{"focus_cy"} = $cy;
+    $parsed->{"focus_cx"} = $cx;
+    return $parsed;
+}
+
+# Load a chunk starting at exact line-aligned $vstart.
+func load_chunk_from(scalar $lf, int $vstart, int $focus_voff) scalar {
+    my int $tot = total_size($lf);
+    if ($vstart < 0) { $vstart = 0; }
+    if ($vstart > $tot) { $vstart = $tot; }
+
+    my scalar $fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $fh = core::open($src, "r");
+    }
+
+    if ($vstart > 0 && $vstart < $tot) {
+        $vstart = find_line_start_fh($lf, $fh, $vstart);
+    }
+
+    my int $target = $lf->{"chunk_target"};
+    my int $vend = $vstart + $target;
+    if ($focus_voff >= $vend) {
+        $vend = $focus_voff + 4096;
+    }
+    if ($vend >= $tot) {
+        $vend = $tot;
+    } else {
+        # Snap $vend to end of line: prefer last '\n' inside [$vstart..$vend], else extend to next '\n'
+        my str $probe = read_range_fh($lf, $fh, $vstart, $vend - $vstart);
+        my int $plen = core::byte_length($probe);
+        my int $last_nl = -1;
+        my int $pi = $plen - 1;
+        while ($pi >= 0) {
+            if (core::get_byte($probe, $pi) == 10) {
+                $last_nl = $pi;
+                last;
+            }
+            $pi = $pi - 1;
+        }
+        if ($last_nl >= 0 && ($vstart + $last_nl + 1) > $focus_voff) {
+            $vend = $vstart + $last_nl + 1;
+        } else {
+            $vend = find_line_end_fh($lf, $fh, $vend);
+        }
+    }
+
+    my scalar $res = build_chunk_result($lf, $fh, $vstart, $vend, $focus_voff);
+    if (defined($fh)) { core::close($fh); }
+    return $res;
+}
+
+# Load a chunk centered/positioned around arbitrary virtual byte offset $focus_voff.
+func load_chunk_around(scalar $lf, int $focus_voff) scalar {
+    my int $tot = total_size($lf);
+    if ($focus_voff < 0) { $focus_voff = 0; }
+    if ($focus_voff > $tot) { $focus_voff = $tot; }
+
+    my scalar $fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $fh = core::open($src, "r");
+    }
+
+    my int $target = $lf->{"chunk_target"};
+    my int $focus_line_start = find_line_start_fh($lf, $fh, $focus_voff);
+    my int $lead = int($target / 4);
+    my int $tentative = $focus_line_start - $lead;
+    my int $vstart = 0;
+    if ($tentative > 0) {
+        my int $cand = find_line_end_fh($lf, $fh, $tentative);
+        if ($cand <= $focus_line_start) {
+            $vstart = $cand;
+        } else {
+            $vstart = $focus_line_start;
+        }
+    }
+    if (defined($fh)) { core::close($fh); }
+    return load_chunk_from($lf, $vstart, $focus_voff);
+}
+
+# Load the chunk immediately preceding $cur_vstart (ending at $cur_vstart).
+func load_prev_chunk(scalar $lf, int $cur_vstart) scalar {
+    if ($cur_vstart <= 0) {
+        return load_chunk_from($lf, 0, 0);
+    }
+    my scalar $fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $fh = core::open($src, "r");
+    }
+
+    my int $target = $lf->{"chunk_target"};
+    my int $tentative = $cur_vstart - $target;
+    my int $vstart = 0;
+    if ($tentative > 0) {
+        my int $cand = find_line_end_fh($lf, $fh, $tentative);
+        if ($cand < $cur_vstart) {
+            $vstart = $cand;
+        } else {
+            $vstart = find_line_start_fh($lf, $fh, $cur_vstart - 1);
+        }
+    }
+    my int $focus = find_line_start_fh($lf, $fh, $cur_vstart - 1);
+    my scalar $res = build_chunk_result($lf, $fh, $vstart, $cur_vstart, $focus);
+    if (defined($fh)) { core::close($fh); }
+    return $res;
+}
+
+# Compute virtual byte offset of ($cy, $cx) within currently loaded chunk $lines.
+func cursor_virtual_offset(scalar $lf, scalar $lines, int $cy, int $cx) int {
+    my int $eol_len = core::byte_length($lf->{"chunk_eol"});
+    if ($eol_len <= 0) { $eol_len = 1; }
+    my int $voff = $lf->{"chunk_vstart"};
+    my int $lcount = scalar(@$lines);
+    if ($cy < 0) { return $voff; }
+    if ($cy >= $lcount) { $cy = $lcount - 1; }
+    my int $i = 0;
+    while ($i < $cy) {
+        $voff = $voff + core::byte_length($lines->[$i]) + $eol_len;
+        $i = $i + 1;
+    }
+    my int $llen = core::byte_length($lines->[$cy]);
+    if ($cx > $llen) { $cx = $llen; }
+    if ($cx > 0) { $voff = $voff + $cx; }
+    return $voff;
+}
+
+# Commit active chunk $lines into $lf spans if modified. Returns 1 if spans changed.
+func commit_chunk(scalar $lf, scalar $lines) int {
+    if (!defined($lf) || !defined($lines)) { return 0; }
+    my str $new_bytes = Smacs::File::serialize($lines, $lf->{"chunk_eol"}, $lf->{"chunk_final_nl"});
+    if ($new_bytes eq $lf->{"chunk_orig_bytes"}) {
+        return 0;
+    }
+    my int $vstart = $lf->{"chunk_vstart"};
+    my int $vend = $lf->{"chunk_vend"};
+    replace_range($lf, $vstart, $vend, $new_bytes);
+    my int $new_len = core::byte_length($new_bytes);
+    $lf->{"chunk_vend"} = $vstart + $new_len;
+    $lf->{"chunk_orig_bytes"} = core::byte_substr($new_bytes, 0, $new_len);
+    return 1;
+}
+
+# Stream-search virtual range [$range_start, $range_end) in direction $dir (1 or -1).
+# Returns { found => 1, voff => int, cancelled => 0 } or { found => 0, voff => -1, cancelled => 0|1 }.
+func search_range(scalar $lf, str $query, int $range_start, int $range_end, int $dir, scalar $progress_cb) scalar {
+    my scalar $res = {};
+    $res->{"found"} = 0;
+    $res->{"voff"} = -1;
+    $res->{"cancelled"} = 0;
+
+    my int $qlen = core::byte_length($query);
+    if ($qlen <= 0) { return $res; }
+    my str $qbytes = core::byte_substr($query, 0, $qlen);
+
+    my int $tot = total_size($lf);
+    if ($range_start < 0) { $range_start = 0; }
+    if ($range_end > $tot) { $range_end = $tot; }
+    if ($range_end - $range_start < $qlen) { return $res; }
+
+    my scalar $fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $fh = core::open($src, "r");
+    }
+
+    my int $block_size = 4194304; # 4 MB SIMD scan blocks
+    if ($block_size < $qlen * 2) { $block_size = $qlen * 2; }
+    my int $overlap = $qlen - 1;
+    my int $step = $block_size - $overlap;
+    my int $blocks_done = 0;
+
+    if ($dir >= 0) {
+        my int $pos = $range_start;
+        while ($pos + $qlen <= $range_end) {
+            my int $rlen = $block_size;
+            if ($pos + $rlen > $range_end) { $rlen = $range_end - $pos; }
+            my str $blk = read_range_fh($lf, $fh, $pos, $rlen);
+            my int $idx = index($blk, $qbytes);
+            if ($idx >= 0) {
+                $res->{"found"} = 1;
+                $res->{"voff"} = $pos + $idx;
+                if (defined($fh)) { core::close($fh); }
+                return $res;
+            }
+            if ($pos + $rlen >= $range_end) { last; }
+            $pos = $pos + $step;
+            $blocks_done = $blocks_done + 1;
+            if (($blocks_done % 8) == 0 && defined($progress_cb)) {
+                if ($progress_cb->($pos, $tot) == 1) {
+                    $res->{"cancelled"} = 1;
+                    if (defined($fh)) { core::close($fh); }
+                    return $res;
+                }
+            }
+        }
+    } else {
+        my int $rend = $range_end;
+        while ($rend - $range_start >= $qlen) {
+            my int $rstart = $rend - $block_size;
+            if ($rstart < $range_start) { $rstart = $range_start; }
+            my int $rlen = $rend - $rstart;
+            my str $blk = read_range_fh($lf, $fh, $rstart, $rlen);
+            # Find last occurrence of $qbytes in $blk
+            my int $last_idx = -1;
+            my int $search_from = 0;
+            while (1) {
+                my int $hit = index($blk, $qbytes, $search_from);
+                if ($hit < 0) { last; }
+                $last_idx = $hit;
+                $search_from = $hit + 1;
+            }
+            if ($last_idx >= 0) {
+                $res->{"found"} = 1;
+                $res->{"voff"} = $rstart + $last_idx;
+                if (defined($fh)) { core::close($fh); }
+                return $res;
+            }
+            if ($rstart <= $range_start) { last; }
+            $rend = $rstart + $overlap;
+            $blocks_done = $blocks_done + 1;
+            if (($blocks_done % 8) == 0 && defined($progress_cb)) {
+                if ($progress_cb->($rstart, $tot) == 1) {
+                    $res->{"cancelled"} = 1;
+                    if (defined($fh)) { core::close($fh); }
+                    return $res;
+                }
+            }
+        }
+    }
+
+    if (defined($fh)) { core::close($fh); }
+    return $res;
+}
+
+func write_all_fd(int $fd, str $data) int {
+    my int $total = core::byte_length($data);
+    my int $off = 0;
+    while ($off < $total) {
+        my str $chunk = $data;
+        if ($off > 0) {
+            $chunk = core::byte_substr($data, $off, $total - $off);
+        }
+        my int $wrote = core::write_fd($fd, $chunk);
+        if ($wrote <= 0) { return -1; }
+        $off = $off + $wrote;
+    }
+    return 0;
+}
+
+# Atomically stream all spans to $path in 4 MB buffers without loading the whole file into memory.
+# Returns "" on success, or an error string on failure (leaving original $path intact).
+func atomic_save(scalar $lf, str $path, scalar $progress_cb) str {
+    my str $target = $path;
+    if (core::file_exists($path) == 1 && core::is_symlink($path) == 1) {
+        my str $real = core::realpath($path);
+        if (length($real) == 0) { return "Cannot resolve symlink: " . $path; }
+        $target = $real;
+    }
+
+    my scalar $old_stat = core::stat($target);
+    my int $mode = 0;
+    my int $uid = -1;
+    my int $gid = -1;
+    if (defined($old_stat)) {
+        $mode = $old_stat->{"mode"} & 07777;
+        $uid = $old_stat->{"uid"};
+        $gid = $old_stat->{"gid"};
+    } else {
+        my int $old_umask = core::umask(0);
+        core::umask($old_umask);
+        $mode = 0666 & (~$old_umask);
+    }
+
+    my scalar $created = core::mkstemp($target . ".smacs.XXXXXX");
+    if (!defined($created) || scalar(@$created) < 2) {
+        return Smacs::File::error_text("Cannot create temporary file for " . $path);
+    }
+    my int $fd = $created->[0];
+    my str $tmp = $created->[1];
+
+    my scalar $src_fh = undef;
+    my str $src = $lf->{"source_path"};
+    if (length($src) > 0 && core::file_exists($src) == 1) {
+        $src_fh = core::open($src, "r");
+    }
+
+    my int $tot = total_size($lf);
+    my int $written_total = 0;
+    my int $copy_buf_size = 4194304; # 4 MB copy buffer
+    my int $blocks = 0;
+    my scalar $spans = $lf->{"spans"};
+    my int $si = 0;
+    my int $sn = scalar(@$spans);
+
+    while ($si < $sn) {
+        my scalar $sp = $spans->[$si];
+        my int $slen = $sp->{"length"};
+        if ($sp->{"kind"} eq "disk") {
+            if (!defined($src_fh) && $slen > 0) {
+                core::close_fd($fd);
+                core::unlink($tmp);
+                return "Cannot read backing file: " . $src;
+            }
+            my int $doff = $sp->{"offset"};
+            my int $rem = $slen;
+            core::seek($src_fh, $doff, 0);
+            while ($rem > 0) {
+                my int $ask = $copy_buf_size;
+                if ($rem < $ask) { $ask = $rem; }
+                my scalar $buf = core::fread($src_fh, $ask);
+                if (!defined($buf) || core::byte_length($buf) == 0) {
+                    if (defined($src_fh)) { core::close($src_fh); }
+                    core::close_fd($fd);
+                    core::unlink($tmp);
+                    return "Unexpected EOF reading backing file: " . $src;
+                }
+                if (write_all_fd($fd, $buf) != 0) {
+                    my str $werr = Smacs::File::error_text("Write failed for " . $path);
+                    if (defined($src_fh)) { core::close($src_fh); }
+                    core::close_fd($fd);
+                    core::unlink($tmp);
+                    return $werr;
+                }
+                my int $got = core::byte_length($buf);
+                $rem = $rem - $got;
+                $written_total = $written_total + $got;
+                $blocks = $blocks + 1;
+                if (($blocks % 8) == 0 && defined($progress_cb)) {
+                    $progress_cb->($written_total, $tot);
+                }
+            }
+        } else {
+            my str $mdata = $sp->{"data"};
+            if ($slen > 0 && write_all_fd($fd, $mdata) != 0) {
+                my str $merr = Smacs::File::error_text("Write failed for " . $path);
+                if (defined($src_fh)) { core::close($src_fh); }
+                core::close_fd($fd);
+                core::unlink($tmp);
+                return $merr;
+            }
+            $written_total = $written_total + $slen;
+        }
+        $si = $si + 1;
+    }
+
+    if (defined($src_fh)) {
+        core::close($src_fh);
+    }
+
+    if (core::fsync($fd) != 0) {
+        my str $serr = Smacs::File::error_text("Sync failed for " . $path);
+        core::close_fd($fd);
+        core::unlink($tmp);
+        return $serr;
+    }
+    if (core::close_fd($fd) != 0) {
+        my str $cerr = Smacs::File::error_text("Close failed for " . $path);
+        core::unlink($tmp);
+        return $cerr;
+    }
+
+    core::chmod($tmp, $mode);
+    if ($uid >= 0 && $gid >= 0) {
+        core::chown($tmp, $uid, $gid);
+    }
+
+    my str $dir = Smacs::File::dirname($target);
+    if (core::rename($tmp, $target) != 0) {
+        my str $rerr = Smacs::File::error_text("Rename failed for " . $path);
+        core::unlink($tmp);
+        return $rerr;
+    }
+
+    my int $dir_fd = core::open_fd($dir, "r");
+    if ($dir_fd >= 0) {
+        core::fsync($dir_fd);
+        core::close_fd($dir_fd);
+    }
+
+    # Reset spans to a single clean disk span on the newly saved target
+    my scalar $clean_spans = [];
+    if ($written_total > 0) {
+        push(@$clean_spans, make_disk_span(0, $written_total));
+    }
+    $lf->{"source_path"} = $target;
+    $lf->{"spans"} = $clean_spans;
+    $lf->{"has_edits"} = 0;
+    return "";
+}
