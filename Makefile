@@ -5,10 +5,10 @@ PCRE2_LIB := $(shell pkg-config --libs libpcre2-8 2>/dev/null || echo "")
 
 all: smacs
 
-smacs: smacs.strada
+smacs: smacs.strada lib/Smacs/*.strada
 	$(STRADA) -O3 smacs.strada
 
-debug: smacs.strada
+debug: smacs.strada lib/Smacs/*.strada
 	$(STRADA) -g smacs.strada
 
 clean:

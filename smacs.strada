@@ -2789,7 +2789,6 @@ func load_syntax_dir(str $dir) void {
             }
             $i = $i + 1;
         }
-        $FORCE_LARGE_OPEN = 0;
     } else {
         # Flat directory of .vim files
         @entries = core::readdir($dir);
@@ -2803,7 +2802,6 @@ func load_syntax_dir(str $dir) void {
             }
             $i = $i + 1;
         }
-        $FORCE_LARGE_OPEN = 0;
     }
     if ($count > 0) {
         set_msg("Loaded " . $count . " syntax files from " . $dir);
@@ -4114,7 +4112,7 @@ func render() void {
                     $vis_w = u8_str_width($vis_plain);
                     $display = $vis_plain;
                     if (length($SYNTAX) > 0) {
-                        $display = highlight_line($vis_plain, $SYNTAX);
+                        $display = highlight_line_uncached($vis_plain, $SYNTAX);
                     }
                 }
                 $row_content = $row_content . $display;

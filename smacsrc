@@ -16,3 +16,8 @@ syntax-dir = /usr/local/share/smacs/syntax
 # Installed to /usr/local/share/smacs/complete by default
 complete-dir = /usr/local/share/smacs/complete
 completion-mode = off
+
+# Large File Mode (streamed chunks for multi-MB/GB files without slurping into RAM)
+# Set large-file-threshold = 0 to disable automatic activation
+large-file-threshold = 16M
+large-file-chunk-size = 1M
