@@ -1,0 +1,395 @@
+package Smacs::Browser;
+
+use Smacs::File;
+use Smacs::LargeFile;
+use Smacs::Text;
+use Smacs::Term;
+
+# Helpers for *Buffers* (BufferMenu) and Dired directory browser.
+
+func format_mode_bits(int $mode) str {
+    my int $ftype = $mode & 0170000;
+    my str $t = "-";
+    if ($ftype == 0040000) { $t = "d"; }
+    elsif ($ftype == 0120000) { $t = "l"; }
+    elsif ($ftype == 0020000) { $t = "c"; }
+    elsif ($ftype == 0060000) { $t = "b"; }
+    elsif ($ftype == 0010000) { $t = "p"; }
+    elsif ($ftype == 0140000) { $t = "s"; }
+
+    my str $ur = (($mode & 0400) != 0) ? "r" : "-";
+    my str $uw = (($mode & 0200) != 0) ? "w" : "-";
+    my str $ux = (($mode & 0100) != 0) ? "x" : "-";
+    if (($mode & 04000) != 0) { $ux = (($mode & 0100) != 0) ? "s" : "S"; }
+
+    my str $gr = (($mode & 0040) != 0) ? "r" : "-";
+    my str $gw = (($mode & 0020) != 0) ? "w" : "-";
+    my str $gx = (($mode & 0010) != 0) ? "x" : "-";
+    if (($mode & 02000) != 0) { $gx = (($mode & 0010) != 0) ? "s" : "S"; }
+
+    my str $or = (($mode & 0004) != 0) ? "r" : "-";
+    my str $ow = (($mode & 0002) != 0) ? "w" : "-";
+    my str $ox = (($mode & 0001) != 0) ? "x" : "-";
+    if (($mode & 01000) != 0) { $ox = (($mode & 0001) != 0) ? "t" : "T"; }
+
+    return $t . $ur . $uw . $ux . $gr . $gw . $gx . $or . $ow . $ox;
+}
+
+func format_mtime(int $mtime) str {
+    if ($mtime < 0) { return "                "; }
+    my scalar $tm = core::localtime($mtime);
+    if (!defined($tm)) { return "                "; }
+    my int $yr = ($tm->{"year"} // 0) + 1900;
+    my int $mo = ($tm->{"mon"} // 0) + 1;
+    my int $dy = $tm->{"mday"} // 1;
+    my int $hr = $tm->{"hour"} // 0;
+    my int $mn = $tm->{"min"} // 0;
+    return sprintf("%04d-%02d-%02d %02d:%02d", $yr, $mo, $dy, $hr, $mn);
+}
+
+func pad_left(str $s, int $width) str {
+    my int $w = Smacs::Text::display_width($s, 4);
+    if ($w >= $width) { return $s; }
+    return (" " x ($width - $w)) . $s;
+}
+
+func pad_right(str $s, int $width) str {
+    my int $w = Smacs::Text::display_width($s, 4);
+    if ($w >= $width) {
+        my str $tr = Smacs::Text::truncate_cols($s, $width - 1, 4);
+        my int $tw = Smacs::Text::display_width($tr, 4);
+        return $tr . (" " x ($width - $tw));
+    }
+    return $s . (" " x ($width - $w));
+}
+
+func clean_dir_path(str $dir) str {
+    my str $real = core::realpath($dir);
+    if (length($real) > 0) { return $real; }
+    while (length($dir) > 1 && substr($dir, length($dir) - 1, 1) eq "/") {
+        $dir = substr($dir, 0, length($dir) - 1);
+    }
+    if (length($dir) == 0) { return "/"; }
+    return $dir;
+}
+
+func join_dir_entry(str $dir, str $name) str {
+    if ($dir eq "/") { return "/" . $name; }
+    return $dir . "/" . $name;
+}
+
+# Read directory and return sorted arrayref of entry hashes:
+# { name, full_path, is_dir, is_link, is_exec, perms, size, mtime_str, link_target, del }
+func read_directory(str $dir, int $show_hidden) scalar {
+    my str $cdir = Smacs::Browser::clean_dir_path($dir);
+    my array @raw = core::readdir($cdir);
+
+    my array @dir_names = ();
+    my array @file_names = ();
+
+    my int $i = 0;
+    while ($i < scalar(@raw)) {
+        my str $nm = $raw[$i];
+        if ($nm ne "." && $nm ne "..") {
+            if ($show_hidden == 1 || substr($nm, 0, 1) ne ".") {
+                my str $fp = Smacs::Browser::join_dir_entry($cdir, $nm);
+                if (core::is_dir($fp) == 1) {
+                    push(@dir_names, $nm);
+                } else {
+                    push(@file_names, $nm);
+                }
+            }
+        }
+        $i = $i + 1;
+    }
+
+    my array @sorted_dirs = sort { $a cmp $b } @dir_names;
+    my array @sorted_files = sort { $a cmp $b } @file_names;
+
+    my array @ordered = ("..");
+    my int $di = 0;
+    while ($di < scalar(@sorted_dirs)) {
+        push(@ordered, $sorted_dirs[$di]);
+        $di = $di + 1;
+    }
+    my int $fi = 0;
+    while ($fi < scalar(@sorted_files)) {
+        push(@ordered, $sorted_files[$fi]);
+        $fi = $fi + 1;
+    }
+
+    my scalar $entries = [];
+    my int $oi = 0;
+    while ($oi < scalar(@ordered)) {
+        my str $name = $ordered[$oi];
+        my str $full = "";
+        if ($name eq "..") {
+            $full = Smacs::File::dirname($cdir);
+        } else {
+            $full = Smacs::Browser::join_dir_entry($cdir, $name);
+        }
+
+        my scalar $lst = core::lstat($full);
+        my scalar $st = core::stat($full);
+        my int $lmode = 0;
+        my int $size = 0;
+        my int $mtime = -1;
+        if (defined($lst)) {
+            $lmode = $lst->{"mode"} // 0;
+            $size = $lst->{"size"} // 0;
+            $mtime = $lst->{"mtime"} // -1;
+        }
+        my int $is_link = (($lmode & 0170000) == 0120000) ? 1 : 0;
+        my int $is_dir = 0;
+        if (defined($st) && (($st->{"mode"} // 0) & 0170000) == 0040000) {
+            $is_dir = 1;
+            if ($is_link == 0) {
+                $size = $st->{"size"} // 0;
+            }
+        }
+        my int $is_exec = 0;
+        if ($is_dir == 0 && $is_link == 0 && (($lmode & 0111) != 0)) {
+            $is_exec = 1;
+        }
+        my str $link_target = "";
+        if ($is_link == 1) {
+            my scalar $lt = core::readlink($full);
+            if (defined($lt)) { $link_target = $lt; }
+        }
+
+        my scalar $ent = {};
+        $ent->{"name"} = $name;
+        $ent->{"full_path"} = $full;
+        $ent->{"is_dir"} = $is_dir;
+        $ent->{"is_link"} = $is_link;
+        $ent->{"is_exec"} = $is_exec;
+        $ent->{"perms"} = Smacs::Browser::format_mode_bits($lmode);
+        $ent->{"size"} = $size;
+        $ent->{"mtime_str"} = Smacs::Browser::format_mtime($mtime);
+        $ent->{"link_target"} = $link_target;
+        $ent->{"del"} = 0;
+        push(@$entries, $ent);
+        $oi = $oi + 1;
+    }
+
+    return $entries;
+}
+
+func format_dired_lines(str $cdir, scalar $entries, int $show_hidden) scalar {
+    my scalar $lines = [];
+    my str $hid_note = "";
+    if ($show_hidden == 0) { $hid_note = " [dotfiles hidden; press . to show]"; }
+    push(@$lines, "  " . $cdir . ":" . $hid_note);
+    my int $count = scalar(@$entries);
+    my int $real_items = ($count > 0) ? ($count - 1) : 0;
+    push(@$lines, "  " . $real_items . " item(s)  (RET:open  o:other-win  ^:up  +:mkdir  R:rename  C:copy  d/x:delete  .:dotfiles  g:refresh  q:quit)");
+
+    my int $i = 0;
+    while ($i < $count) {
+        my scalar $e = $entries->[$i];
+        my str $mark = ($e->{"del"} == 1) ? "D" : " ";
+        my str $sz = Smacs::Browser::pad_left(Smacs::LargeFile::format_bytes($e->{"size"}), 8);
+        my str $disp_name = $e->{"name"};
+        if ($e->{"is_dir"} == 1 && $disp_name ne "..") {
+            $disp_name = $disp_name . "/";
+        } elsif ($e->{"is_exec"} == 1) {
+            $disp_name = $disp_name . "*";
+        }
+        if ($e->{"is_link"} == 1 && length($e->{"link_target"}) > 0) {
+            $disp_name = $disp_name . " -> " . $e->{"link_target"};
+        }
+        my str $row = $mark . " " . $e->{"perms"} . " " . $sz . "  " . $e->{"mtime_str"} . "  " . $disp_name;
+        push(@$lines, $row);
+        $i = $i + 1;
+    }
+    return $lines;
+}
+
+# Format *Buffers* lines from bmenu_entries and live $buffers array.
+func format_buffer_menu_lines(scalar $bmenu_entries, scalar $buffers, str $origin_bname) scalar {
+    my scalar $lines = [];
+    push(@$lines, "CRM Buffer                    Size  Mode            File");
+    push(@$lines, "--- ------                    ----  ----            ----");
+
+    my int $i = 0;
+    while ($i < scalar(@$bmenu_entries)) {
+        my scalar $item = $bmenu_entries->[$i];
+        my str $bname = $item->{"name"};
+        my scalar $b = undef;
+        my int $bi = 0;
+        while ($bi < scalar(@$buffers)) {
+            if ($buffers->[$bi]->{"name"} eq $bname) {
+                $b = $buffers->[$bi];
+                last;
+            }
+            $bi = $bi + 1;
+        }
+        if (defined($b)) {
+            my str $c0 = " ";
+            if (($item->{"del"} // 0) == 1) { $c0 = "D"; }
+            elsif ($bname eq $origin_bname) { $c0 = "."; }
+
+            my str $bmode = $b->{"mode"} // "Text";
+            if (($b->{"large_mode"} // 0) == 1) {
+                $bmode = $bmode . "/Large";
+            }
+            my str $c1 = " ";
+            if ($bmode eq "Help" || $bmode eq "BufferMenu" || $bmode eq "Dired" || $bmode eq "Term" || $bmode eq "Term-Copy") {
+                $c1 = "%";
+            }
+            my str $c2 = (($b->{"dirty"} // 0) == 1) ? "*" : " ";
+
+            # Compute size string without scanning multi-GB files
+            my str $sz_str = "0B";
+            if ($bmode eq "Term" || $bmode eq "Term-Copy") {
+                my int $vtp = $b->{"term_vt"} // 0;
+                $sz_str = ($vtp != 0 && Smacs::Term::is_alive($vtp) == 1) ? "live" : "done";
+            } elsif (($b->{"large_mode"} // 0) == 1 && defined($b->{"lf"})) {
+                $sz_str = Smacs::LargeFile::format_bytes(Smacs::LargeFile::total_size($b->{"lf"}));
+            } elsif (($b->{"hex_mode"} // 0) == 1 && defined($b->{"hex_data"})) {
+                $sz_str = Smacs::LargeFile::format_bytes(core::byte_length($b->{"hex_data"}));
+            } else {
+                my scalar $blines = $b->{"lines"};
+                my int $lc = defined($blines) ? scalar(@$blines) : 0;
+                my int $bytes = 0;
+                my int $li = 0;
+                while ($li < $lc) {
+                    $bytes = $bytes + core::byte_length($blines->[$li]);
+                    if ($li > 0) { $bytes = $bytes + 1; }
+                    $li = $li + 1;
+                }
+                if (($b->{"final_newline"} // 0) == 1 && $lc > 0) { $bytes = $bytes + 1; }
+                $sz_str = Smacs::LargeFile::format_bytes($bytes);
+            }
+
+            my str $fname = $b->{"filename"} // "";
+            if ($bmode eq "Dired" && defined($b->{"dired_dir"})) {
+                $fname = $b->{"dired_dir"};
+            } elsif (($bmode eq "Term" || $bmode eq "Term-Copy") && defined($b->{"term_cwd"})) {
+                $fname = $b->{"term_cwd"};
+            }
+
+            my str $col_buf = Smacs::Browser::pad_right($bname, 24);
+            my str $col_sz = Smacs::Browser::pad_left($sz_str, 6);
+            my str $col_mode = Smacs::Browser::pad_right($bmode, 16);
+            my str $row = $c0 . $c1 . $c2 . " " . $col_buf . $col_sz . "  " . $col_mode . $fname;
+            push(@$lines, $row);
+        }
+        $i = $i + 1;
+    }
+    return $lines;
+}
+
+# Stream-copy $src to $dst in 4 MB chunks (safe for multi-GB files). Returns "" on success or error message.
+func copy_file_streaming(str $src, str $dst) str {
+    my scalar $in_fh = core::open($src, "r");
+    if (!defined($in_fh)) {
+        return Smacs::File::error_text("Cannot open source " . $src);
+    }
+    my scalar $st = core::stat($src);
+    my int $mode = 0644;
+    if (defined($st)) {
+        $mode = ($st->{"mode"} // 0644) & 07777;
+    }
+
+    my scalar $created = core::mkstemp($dst . ".smacs.XXXXXX");
+    if (!defined($created) || scalar(@$created) < 2) {
+        core::close($in_fh);
+        return Smacs::File::error_text("Cannot create destination " . $dst);
+    }
+    my int $fd = $created->[0];
+    my str $tmp = $created->[1];
+
+    while (1) {
+        my scalar $chunk = core::fread($in_fh, 4194304);
+        if (!defined($chunk) || core::byte_length($chunk) == 0) {
+            last;
+        }
+        if (Smacs::LargeFile::write_all_fd($fd, $chunk) != 0) {
+            my str $werr = Smacs::File::error_text("Write failed for " . $dst);
+            core::close($in_fh);
+            core::close_fd($fd);
+            core::unlink($tmp);
+            return $werr;
+        }
+    }
+    core::close($in_fh);
+
+    if (core::fsync($fd) != 0) {
+        my str $serr = Smacs::File::error_text("Sync failed for " . $dst);
+        core::close_fd($fd);
+        core::unlink($tmp);
+        return $serr;
+    }
+    core::close_fd($fd);
+    core::chmod($tmp, $mode);
+
+    if (core::rename($tmp, $dst) != 0) {
+        my str $rerr = Smacs::File::error_text("Rename failed for " . $dst);
+        core::unlink($tmp);
+        return $rerr;
+    }
+    return "";
+}
+
+# ANSI highlighting for a single expanded line in Dired or BufferMenu mode.
+func highlight_browser_line(str $line, str $mode, int $filerow) str {
+    my str $esc = chr(27);
+    my str $rst = $esc . "[0m";
+    my int $len = length($line);
+    if ($len == 0) { return ""; }
+
+    if ($mode eq "Dired") {
+        if ($filerow == 0) {
+            return $esc . "[1;36m" . $line . $rst;
+        }
+        if ($filerow == 1) {
+            return $esc . "[90m" . $line . $rst;
+        }
+        my str $mch = substr($line, 0, 1);
+        if ($mch eq "D") {
+            return $esc . "[1;31m" . $line . $rst;
+        }
+        if ($len > 2) {
+            my str $ft = substr($line, 2, 1);
+            # Name column starts after: "M perms(10) size(8)  YYYY-MM-DD HH:MM(16)  " = 41 chars
+            if ($len > 41) {
+                my str $meta = substr($line, 0, 41);
+                my str $nm = substr($line, 41);
+                if ($ft eq "d") {
+                    return $esc . "[90m" . $meta . $rst . $esc . "[1;34m" . $nm . $rst;
+                }
+                if ($ft eq "l") {
+                    return $esc . "[90m" . $meta . $rst . $esc . "[36m" . $nm . $rst;
+                }
+                if (substr($nm, length($nm) - 1, 1) eq "*") {
+                    return $esc . "[90m" . $meta . $rst . $esc . "[1;32m" . $nm . $rst;
+                }
+                return $esc . "[90m" . $meta . $rst . $nm;
+            }
+        }
+        return $line;
+    }
+
+    if ($mode eq "BufferMenu") {
+        if ($filerow == 0) {
+            return $esc . "[1;36m" . $line . $rst;
+        }
+        if ($filerow == 1) {
+            return $esc . "[90m" . $line . $rst;
+        }
+        my str $c0 = substr($line, 0, 1);
+        if ($c0 eq "D") {
+            return $esc . "[1;31m" . $line . $rst;
+        }
+        if ($len >= 3 && substr($line, 2, 1) eq "*") {
+            return $esc . "[1;33m" . substr($line, 0, 3) . $rst . substr($line, 3);
+        }
+        if ($c0 eq ".") {
+            return $esc . "[1;32m." . $rst . substr($line, 1);
+        }
+        return $line;
+    }
+
+    return $line;
+}

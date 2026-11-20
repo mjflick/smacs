@@ -248,10 +248,14 @@ restores the original cursor position.
 | Key | Action |
 |-----|--------|
 | `C-x C-s` | Save file |
-| `C-x C-f` | Find (open) file |
+| `C-x C-f` | Find file (or open directory in Dired) |
+| `C-x d` | Open Dired directory browser |
+| `C-x C-j` | Jump to current file in Dired |
 | `C-x C-w` | Write file (save as) |
 | `C-x b` | Switch buffer |
 | `C-x k` | Kill buffer |
+| `C-x C-b` | Interactive buffer list (`*Buffers*`) |
+| `C-x t` | Create terminal session buffer (`M-x create-terminal`) |
 | `C-x RIGHT` | Next buffer |
 | `C-x LEFT` | Previous buffer |
 | `C-x C-c` | Quit |
@@ -285,6 +289,22 @@ restores the original cursor position.
 `count-words`, `count-lines`, `revert-buffer`, `set-syntax`,
 `load-vim-syntax`, `what-cursor-position`, `line-numbers-mode`,
 `which-function-mode`, `hex-mode`
+
+### Interactive Buffer List (`*Buffers*`) & Dired
+
+- **`C-x C-b`** (`M-x list-buffers` / `M-x buffer-menu`) opens `*Buffers*`:
+  - `RET` / `f`: switch to buffer; `o` / `C-o`: open in other window
+  - `s`: save buffer under cursor; `d`: mark `D` for deletion; `u`: unmark; `x`: kill marked buffers; `g`: refresh; `q`: close
+- **`C-x d`** (`M-x dired`), `C-x C-j` (`dired-jump`), `C-x C-f <dir> RET`, or `smacs <dir>` opens **Dired**:
+  - `RET` / `f`: open file or enter directory; `^`: parent directory; `o` / `C-o`: open in other window; `L`: open in Large File Mode
+  - `+`: create directory; `R`: rename/move; `C`: copy file; `d` / `u` / `x`: mark & delete; `.`: toggle dotfiles; `g`: refresh; `q`: close
+
+### Embedded Terminal Buffers (`M-x create-terminal`)
+
+Run `M-x create-terminal` (or `C-x t`) to launch an interactive PTY shell inside a `*terminal*` buffer (multiple sessions become `*terminal<2>*`, etc.).
+- All shell keys (`C-c`, `C-d`, `C-r`, `TAB`, arrows, colors, full-screen TUIs) go directly to the terminal.
+- `C-x` is the editor prefix (`C-x o` switch window, `C-x b` switch buffer, `C-x 2`/`3` split, `C-x C-x` send literal `C-x`, `C-x y` paste kill ring).
+- `C-x [` (`M-x term-copy-mode`) enters scrollback/copy mode (`C-s` search, `C-SPC` + `M-w` copy, `q` or `i` to resume live input).
 
 ### Large File Mode
 

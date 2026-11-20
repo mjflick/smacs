@@ -195,13 +195,25 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 : Save file.
 
 `C-x C-f`
-: Find (open) file. Starts in the directory of the current file.
+: Find (open) file, or open a directory in Dired. Starts in the directory of the current file.
+
+`C-x d`
+: Open Dired directory browser (`RET` opens file/subdir, `^` parent dir, `+` mkdir, `R` rename, `C` copy, `d`/`x` mark and delete, `.` toggle dotfiles, `q` quit).
+
+`C-x C-j`
+: Jump to the current file's parent directory in Dired.
 
 `C-x C-w`
 : Write file (save as).
 
 `C-x b`
 : Switch buffer. Suggests the last viewed buffer as default.
+
+`C-x C-b`
+: Open interactive `*Buffers*` list (`RET` switch, `o` other window, `s` save, `d`/`x` mark and kill, `u` unmark, `q` quit).
+
+`C-x t`
+: Create a PTY terminal session buffer (same as `M-x create-terminal`).
 
 `C-x k`
 : Kill buffer.
@@ -258,7 +270,9 @@ comments. Tilde (`~`) is expanded to `$HOME` in paths.
 `tabify`, `untabify`, `indent-tabs-mode`, `fill-paragraph`,
 `set-fill-column`, `count-words`, `count-lines`, `revert-buffer`,
 `set-syntax`, `load-vim-syntax`, `what-cursor-position`,
-`line-numbers-mode`, `which-function-mode`, `hex-mode`,
+`line-numbers-mode`, `which-function-mode`, `dired`, `dired-jump`,
+`buffer-menu`, `create-terminal`, `term-copy-mode`, `large-file-mode`,
+`find-file-large`, `large-replace-all`, `hex-mode`,
 `completion-mode`, `reload-completions`
 
 # HEX MODE

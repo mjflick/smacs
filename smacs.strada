@@ -24,6 +24,8 @@ use Smacs::Text;
 use Smacs::File;
 use Smacs::Commands;
 use Smacs::LargeFile;
+use Smacs::Browser;
+use Smacs::Term;
 
 our int $SIGWINCH_FLAG;    # set by SIGWINCH signal handler
 our int $EXIT_SIGNAL;      # set by INT/TERM/HUP signal handlers
@@ -499,6 +501,9 @@ func wait_key() str {
             update_size();
             render();
         }
+        if (poll_all_terminals() == 1) {
+            render();
+        }
         my str $k = read_key();
         if (length($k) > 0) {
             return $k;
@@ -624,6 +629,13 @@ func buf_new(str $name, str $filename) void {
     $buf->{"hex_prev_syntax"} = "";
     $buf->{"large_mode"} = 0;
     $buf->{"lf"} = undef;
+    $buf->{"dired_dir"} = "";
+    $buf->{"dired_entries"} = undef;
+    $buf->{"dired_show_hidden"} = 1;
+    $buf->{"bmenu_entries"} = undef;
+    $buf->{"bmenu_origin"} = "";
+    $buf->{"term_vt"} = 0;
+    $buf->{"term_cwd"} = "";
     push(@$BUFFERS, $buf);
 }
 
@@ -1487,7 +1499,7 @@ func lf_save_progress_callback(int $pos, int $tot) void {
 func lf_open_file(str $path) void {
     $path = expand_tilde($path);
     if (is_directory($path) == 1) {
-        set_msg("Cannot open directory: " . $path);
+        dired_open_in_current_buffer($path, "");
         return;
     }
     my int $is_new = 0;
@@ -1547,7 +1559,7 @@ func lf_open_file(str $path) void {
 func file_open(str $path) void {
     $path = expand_tilde($path);
     if (is_directory($path) == 1) {
-        set_msg("Cannot open directory: " . $path);
+        dired_open_in_current_buffer($path, "");
         return;
     }
     my scalar $fp0 = Smacs::File::fingerprint($path);
@@ -1790,6 +1802,14 @@ func file_save_to(str $target_path, int $is_save_as) void {
 }
 
 func file_save() void {
+    if ($MODE eq "BufferMenu") {
+        bmenu_save_selected();
+        return;
+    }
+    if ($MODE eq "Dired" || $MODE eq "Help") {
+        set_msg("Buffer is not a file buffer.");
+        return;
+    }
     if ($HEX_MODE == 1) {
         hex_file_save();
         return;
@@ -3907,13 +3927,27 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
     } else {
         $left = $left . "--";
     }
-    # Show full path if available on active window, otherwise buffer name
-    if ($is_active == 1 && length($FNAME) > 0) {
+    # Show full path / directory / terminal cwd on active window
+    if ($is_active == 1 && $mode eq "Dired") {
+        my str $dd = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        if (length($dd) > 0) {
+            $left = $left . " " . terminal_safe($bname) . " (" . terminal_safe($dd) . ")";
+        } else {
+            $left = $left . " " . terminal_safe($bname);
+        }
+    } elsif ($is_active == 1 && ($mode eq "Term" || $mode eq "Term-Copy")) {
+        my str $tcwd = $BUFFERS->[$BUF_IDX]->{"term_cwd"} // "";
+        if (length($tcwd) > 0) {
+            $left = $left . " " . terminal_safe($bname) . " (" . terminal_safe($tcwd) . ")";
+        } else {
+            $left = $left . " " . terminal_safe($bname);
+        }
+    } elsif ($is_active == 1 && length($FNAME) > 0) {
         $left = $left . " " . terminal_safe($FNAME);
     } else {
         $left = $left . " " . terminal_safe($bname);
     }
-    if ($is_active == 1) {
+    if ($is_active == 1 && $mode ne "Term" && $mode ne "Dired" && $mode ne "BufferMenu") {
         my str $wf = which_function();
         if (length($wf) > 0) {
             $left = $left . "  " . $wf . "()";
@@ -3925,6 +3959,13 @@ func render_status_bar(str $bname, str $mode, int $dirty, int $cy, int $cx, int 
         my str $area = "hex";
         if ($HEX_IN_ASCII == 1) { $area = "ascii"; }
         $right = " 0x" . hex_offset_str($HEX_BYTE_POS) . " [" . $area . "] " . hex_data_len() . " bytes ";
+    } elsif ($mode eq "Term") {
+        my int $tvt = $BUFFERS->[$BUF_IDX]->{"term_vt"} // 0;
+        my str $tstate = ($tvt != 0 && Smacs::Term::is_alive($tvt) == 1) ? "running" : "exited";
+        $disp_mode = "Term:" . $tstate;
+        my int $tr = ($tvt != 0) ? (Smacs::Term::cursor_row($tvt) + 1) : 1;
+        my int $tc = ($tvt != 0) ? (Smacs::Term::cursor_col($tvt) + 1) : 1;
+        $right = " R" . $tr . " C" . $tc . " ";
     } elsif ($LARGE_MODE == 1 && $is_active == 1 && defined($LF_STATE)) {
         $disp_mode = $disp_mode . "/Large";
         my int $tot = Smacs::LargeFile::total_size($LF_STATE);
@@ -4073,10 +4114,17 @@ func render() void {
             if ($SY < 0) { $SY = 0; }
         }
 
-        my int $gutter = linum_width();
+        my int $w_vt = $BUFFERS->[$wbi]->{"term_vt"} // 0;
+        my int $is_term_live = ($MODE eq "Term" && $w_vt != 0) ? 1 : 0;
+
+        my int $gutter = ($is_term_live == 1 || $MODE eq "Dired" || $MODE eq "BufferMenu") ? 0 : linum_width();
         if ($gutter >= $win_width) { $gutter = 0; }
         my int $text_cols = $win_width - $gutter;
         if ($text_cols < 1) { $text_cols = 1; }
+
+        if ($is_term_live == 1) {
+            Smacs::Term::resize($w_vt, $win_height, $win_width);
+        }
 
         if ($is_active == 1) {
             $active_top = $win_top;
@@ -4093,6 +4141,17 @@ func render() void {
             my int $scr_row = $win_top + $r + 1;
             my int $scr_col = $win_left + 1;
             $out = $out . $E . "[" . $scr_row . ";" . $scr_col . "H";
+
+            if ($is_term_live == 1) {
+                my str $trow = Smacs::Term::render_row($w_vt, $r, $win_width);
+                if ($reaches_right == 1) {
+                    $out = $out . $trow . $E . "[K";
+                } else {
+                    $out = $out . $trow;
+                }
+                $r = $r + 1;
+                next;
+            }
 
             my str $row_content = "";
             my int $drawn_cols = 0;
@@ -4123,6 +4182,13 @@ func render() void {
                             $display = $colored;
                         } else {
                             $display = Smacs::Text::ansi_slice_cols($colored, $SX, $text_cols);
+                        }
+                    } elsif ($MODE eq "Dired" || $MODE eq "BufferMenu") {
+                        my str $bcolored = Smacs::Browser::highlight_browser_line($expanded, $MODE, $filerow);
+                        if ($SX == 0 && u8_str_width($expanded) <= $text_cols) {
+                            $display = $bcolored;
+                        } else {
+                            $display = Smacs::Text::ansi_slice_cols($bcolored, $SX, $text_cols);
                         }
                     }
                 } else {
@@ -4365,12 +4431,20 @@ func render() void {
     }
 
     # Position cursor in active window (clamp to valid screen range)
-    my int $screen_y = $CY - $SY + $active_top + 1;
+    my int $screen_y = 1;
+    my int $screen_x = 1;
+    my int $act_vt = $BUFFERS->[$BUF_IDX]->{"term_vt"} // 0;
+    if ($MODE eq "Term" && $act_vt != 0) {
+        $screen_y = $active_top + Smacs::Term::cursor_row($act_vt) + 1;
+        $screen_x = $active_left + Smacs::Term::cursor_col($act_vt) + 1;
+    } else {
+        $screen_y = $CY - $SY + $active_top + 1;
+        my str $cur_line = get_line($CY);
+        my int $cursor_col = u8_byte_to_col($cur_line, $CX);
+        $screen_x = $cursor_col - $SX + 1 + $gutter + $active_left;
+    }
     if ($screen_y < 1) { $screen_y = 1; }
     if ($screen_y > $ROWS) { $screen_y = $ROWS; }
-    my str $cur_line = get_line($CY);
-    my int $cursor_col = u8_byte_to_col($cur_line, $CX);
-    my int $screen_x = $cursor_col - $SX + 1 + $gutter + $active_left;
     if ($screen_x < 1) { $screen_x = 1; }
     if ($screen_x > $COLS) { $screen_x = $COLS; }
     $out = $out . $E . "[" . $screen_y . ";" . $screen_x . "H";
@@ -6064,8 +6138,8 @@ func common_prefix(array @strs) str {
     return $prefix;
 }
 
-# Get file completions for a partial path
-func complete_file(str $input) array {
+# Get file completions for a partial path, reusing $cache hash for the scanned directory
+func complete_file_cached(str $input, scalar $cache) array {
     my array @matches = ();
     if (length($input) == 0) {
         $input = "./";
@@ -6083,23 +6157,40 @@ func complete_file(str $input) array {
     } else {
         $dir = path_dirname($input);
         $prefix = path_basename($input);
-        if (substr($dir, length($dir) - 1, 1) ne "/") {
+        if (substr($dir, length($dir) - 1) ne "/") {
             $dir = $dir . "/";
         }
     }
 
     my str $fs_dir = expand_tilde($dir);
-    my array @entries = list_dir($fs_dir);
-    my array @sorted = sort { $a cmp $b; } @entries;
+    my scalar $sorted_ref = undef;
+    if (defined($cache) && ($cache->{"dir"} // "") eq $fs_dir && defined($cache->{"entries"})) {
+        $sorted_ref = $cache->{"entries"};
+    } else {
+        my array @entries = list_dir($fs_dir);
+        my array @sorted = sort { $a cmp $b; } @entries;
+        $sorted_ref = \@sorted;
+        if (defined($cache)) {
+            $cache->{"dir"} = $fs_dir;
+            $cache->{"entries"} = $sorted_ref;
+        }
+    }
+
     my int $i = 0;
-    while ($i < scalar(@sorted)) {
-        my str $entry = $sorted[$i];
-        if (length($prefix) == 0 || substr($entry, 0, length($prefix)) eq $prefix) {
+    my int $plen = length($prefix);
+    while ($i < scalar(@$sorted_ref)) {
+        my str $entry = $sorted_ref->[$i];
+        if ($plen == 0 || (length($entry) >= $plen && substr($entry, 0, $plen) eq $prefix)) {
             push(@matches, $dir . $entry);
         }
         $i = $i + 1;
     }
     return @matches;
+}
+
+# Get file completions for a partial path
+func complete_file(str $input) array {
+    return complete_file_cached($input, undef);
 }
 
 # Get buffer name completions
@@ -7179,10 +7270,29 @@ func goto_line_spec(str $spec) void {
     }
 }
 
+func any_terminal_running() int {
+    my int $i = 0;
+    while ($i < buf_count()) {
+        my int $vt = $BUFFERS->[$i]->{"term_vt"} // 0;
+        if ($vt != 0 && Smacs::Term::is_alive($vt) == 1) {
+            return 1;
+        }
+        $i = $i + 1;
+    }
+    return 0;
+}
+
 func cmd_quit_editor() void {
     if (any_buffer_dirty() == 1) {
         my int $yn = mb_read_yn("Modified buffers exist; exit anyway?");
         if ($yn != 1) {
+            set_msg("Cancelled.");
+            return;
+        }
+    }
+    if (any_terminal_running() == 1) {
+        my int $tyn = mb_read_yn("Active terminal session(s) exist; exit anyway?");
+        if ($tyn != 1) {
             set_msg("Cancelled.");
             return;
         }
@@ -7203,10 +7313,10 @@ func cmd_mx() void {
             return;
         }
     }
-    if ($MODE eq "Help") {
+    if ($MODE eq "Help" || $MODE eq "Dired" || $MODE eq "BufferMenu" || $MODE eq "Term" || $MODE eq "Term-Copy") {
         if ($cmd eq "replace-regexp" || $cmd eq "query-replace" || $cmd eq "replace-string" ||
-            $cmd eq "tabify" || $cmd eq "untabify" || $cmd eq "fill-paragraph" ||
-            $cmd eq "comment-region" || $cmd eq "uncomment-region") {
+            $cmd eq "large-replace-all" || $cmd eq "tabify" || $cmd eq "untabify" ||
+            $cmd eq "fill-paragraph" || $cmd eq "comment-region" || $cmd eq "uncomment-region") {
             set_msg("Buffer is read-only.");
             return;
         }
@@ -7217,6 +7327,16 @@ func cmd_mx() void {
         return;
     }
     if ($cmd eq "refresh-buffer" || $cmd eq "revert-buffer") {
+        if ($MODE eq "Dired") {
+            dired_refresh("");
+            set_msg("Directory refreshed.");
+            return;
+        }
+        if ($MODE eq "BufferMenu") {
+            bmenu_rebuild_lines("");
+            set_msg("Buffer list refreshed.");
+            return;
+        }
         if (length($FNAME) == 0) {
             set_msg("Buffer has no file.");
             return;
@@ -7367,8 +7487,21 @@ func cmd_mx() void {
     if ($cmd eq "write-file") { cmd_write_file(); return; }
     if ($cmd eq "kill-buffer") { cmd_kill_buffer(); return; }
     if ($cmd eq "find-file") { cmd_find_file(); return; }
+    if ($cmd eq "dired") { cmd_dired(); return; }
+    if ($cmd eq "dired-jump") { cmd_dired_jump(); return; }
+    if ($cmd eq "create-terminal") { cmd_create_terminal(); return; }
+    if ($cmd eq "term-copy-mode") {
+        if ($MODE eq "Term") {
+            term_enter_copy_mode();
+        } elsif ($MODE eq "Term-Copy") {
+            term_leave_copy_mode();
+        } else {
+            set_msg("Not in a terminal buffer.");
+        }
+        return;
+    }
     if ($cmd eq "switch-buffer") { cmd_switch_buffer(); return; }
-    if ($cmd eq "list-buffers") { cmd_list_buffers(); return; }
+    if ($cmd eq "list-buffers" || $cmd eq "buffer-menu") { cmd_list_buffers(); return; }
     if ($cmd eq "next-buffer") { buf_cycle(1); return; }
     if ($cmd eq "previous-buffer") { buf_cycle(-1); return; }
     if ($cmd eq "split-window") { win_split(); return; }
@@ -7613,11 +7746,20 @@ func cmd_mx() void {
 # Buffer Commands
 # ===========================================================================
 
-# Emacs-style file finder with completions panel
 func mb_read_file(str $prompt) str {
+    return mb_read_file_ex($prompt, 0);
+}
+
+# Emacs-style file finder with completions panel ($allow_dir == 1 returns directory paths on RET)
+func mb_read_file_ex(str $prompt, int $allow_dir) str {
     $MB_CANCELLED = 0;
     my str $input = core::getcwd() . "/";
-    if (length($FNAME) > 0) {
+    if ($MODE eq "Dired") {
+        my str $dd = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        if (length($dd) > 0) {
+            $input = ($dd eq "/") ? "/" : ($dd . "/");
+        }
+    } elsif (length($FNAME) > 0) {
         my str $fdir = path_dirname($FNAME);
         if ($fdir eq ".") {
             $input = core::getcwd() . "/";
@@ -7637,6 +7779,7 @@ func mb_read_file(str $prompt) str {
     my str $notice = "";
     my int $need_redraw = 1;
     my array @comp_list = ();
+    my scalar $dir_cache = {};
 
     while (1) {
         if ($EXIT_SIGNAL == 1) {
@@ -7651,7 +7794,7 @@ func mb_read_file(str $prompt) str {
 
         if ($need_redraw == 1) {
             $need_redraw = 0;
-            @comp_list = complete_file($input);
+            @comp_list = complete_file_cached($input, $dir_cache);
 
             my int $panel_rows = 0;
             if ($show_completions == 1 && scalar(@comp_list) > 0) {
@@ -7751,7 +7894,8 @@ func mb_read_file(str $prompt) str {
             next;
         }
         $notice = "";
-        $need_redraw = 1;
+        # Coalesce rapid/pasted keystrokes before redrawing the completions panel
+        $need_redraw = (stdin_has_pending() == 0) ? 1 : 0;
 
         if ($key eq "RET") {
             my str $expanded = expand_tilde($input);
@@ -7760,6 +7904,13 @@ func mb_read_file(str $prompt) str {
                 next;
             }
             if (is_directory($expanded) == 1) {
+                if ($allow_dir == 1) {
+                    if ($show_completions == 1) {
+                        render();
+                    }
+                    hist_add("file", $input);
+                    return $input;
+                }
                 if (substr($input, length($input) - 1, 1) ne "/") {
                     $input = $input . "/";
                     $pos = length($input);
@@ -7785,6 +7936,8 @@ func mb_read_file(str $prompt) str {
             return "";
         }
         if ($key eq "TAB") {
+            @comp_list = complete_file_cached($input, $dir_cache);
+            $need_redraw = 1;
             if (scalar(@comp_list) == 0) {
                 $notice = "[No match]";
             } elsif (scalar(@comp_list) == 1) {
@@ -7944,15 +8097,50 @@ func mb_read_file(str $prompt) str {
     return "";
 }
 
-func find_file_with_mode(str $prompt, int $force_large) void {
-    my str $path = mb_read_file($prompt);
-    if ($MB_CANCELLED == 1 || length($path) == 0) { return; }
+func switch_to_buffer_idx(int $idx, int $other_win, int $keep_focus) void {
+    if ($idx < 0 || $idx >= buf_count()) { return; }
+    if ($other_win == 0) {
+        my str $prev = $BNAME;
+        buf_save_state();
+        win_save_state();
+        buf_load_state($idx);
+        my scalar $cw = $WINDOWS->[$WIN_IDX];
+        $cw->{"buf_idx"} = $BUF_IDX;
+        $cw->{"cy"} = $CY;
+        $cw->{"cx"} = $CX;
+        $cw->{"sy"} = $SY;
+        $cw->{"sx"} = $SX;
+        if ($prev ne $BNAME) { $LAST_BUFFER = $prev; }
+        return;
+    }
+
+    my int $orig_win = $WIN_IDX;
+    my str $orig_bname = $BNAME;
+    if ($WIN_COUNT <= 1) {
+        win_split();
+    }
+    win_other();
+    buf_save_state();
+    buf_load_state($idx);
+    my scalar $tw = $WINDOWS->[$WIN_IDX];
+    $tw->{"buf_idx"} = $BUF_IDX;
+    $tw->{"cy"} = $CY;
+    $tw->{"cx"} = $CX;
+    $tw->{"sy"} = $SY;
+    $tw->{"sx"} = $SX;
+    if ($orig_bname ne $BNAME) { $LAST_BUFFER = $orig_bname; }
+    if ($keep_focus == 1) {
+        win_load_state($orig_win);
+    }
+}
+
+func open_file_target(str $path, int $force_large, int $other_win, int $keep_focus) void {
     $path = expand_tilde($path);
     if (length($path) > 1 && substr($path, length($path) - 1, 1) eq "/" && is_directory($path) != 1) {
         $path = substr($path, 0, length($path) - 1);
     }
     if (is_directory($path) == 1) {
-        set_msg("Cannot open directory: " . $path);
+        dired_open($path, "", $other_win, $keep_focus);
         return;
     }
 
@@ -7961,17 +8149,13 @@ func find_file_with_mode(str $prompt, int $force_large) void {
     while ($i < buf_count()) {
         my scalar $b = $BUFFERS->[$i];
         if (same_file_path($b->{"filename"}, $path) == 1) {
-            my str $prev0 = $BNAME;
-            buf_save_state();
-            win_save_state();
-            buf_load_state($i);
-            my scalar $cw0 = $WINDOWS->[$WIN_IDX];
-            $cw0->{"buf_idx"} = $BUF_IDX;
-            if ($prev0 ne $BNAME) { $LAST_BUFFER = $prev0; }
-            if ($force_large == 1 && $LARGE_MODE == 0 && $DIRTY == 0) {
+            switch_to_buffer_idx($i, $other_win, $keep_focus);
+            if ($force_large == 1 && $keep_focus == 0 && $LARGE_MODE == 0 && $DIRTY == 0) {
                 lf_open_file($path);
-            } else {
+            } elsif ($keep_focus == 0) {
                 set_msg("Switched to: " . $BNAME);
+            } else {
+                set_msg("Displayed in other window: " . $BUFFERS->[$i]->{"name"});
             }
             return;
         }
@@ -7988,7 +8172,12 @@ func find_file_with_mode(str $prompt, int $force_large) void {
         core::close($tfh);
     }
 
+    my int $orig_win = $WIN_IDX;
     my str $prev = $BNAME;
+    if ($other_win == 1) {
+        if ($WIN_COUNT <= 1) { win_split(); }
+        win_other();
+    }
     buf_save_state();
     win_save_state();
     buf_new(path_basename($path), $path);
@@ -8000,7 +8189,21 @@ func find_file_with_mode(str $prompt, int $force_large) void {
     }
     my scalar $cw = $WINDOWS->[$WIN_IDX];
     $cw->{"buf_idx"} = $BUF_IDX;
+    $cw->{"cy"} = $CY;
+    $cw->{"cx"} = $CX;
+    $cw->{"sy"} = $SY;
+    $cw->{"sx"} = $SX;
     $LAST_BUFFER = $prev;
+    if ($other_win == 1 && $keep_focus == 1) {
+        win_load_state($orig_win);
+        set_msg("Opened in other window: " . path_basename($path));
+    }
+}
+
+func find_file_with_mode(str $prompt, int $force_large) void {
+    my str $path = mb_read_file_ex($prompt, 1);
+    if ($MB_CANCELLED == 1 || length($path) == 0) { return; }
+    open_file_target($path, $force_large, 0, 0);
 }
 
 func cmd_find_file() void {
@@ -8050,20 +8253,36 @@ func cmd_switch_buffer() void {
     }
 }
 
-func cmd_kill_buffer() void {
-    if ($DIRTY == 1) {
-        my int $yn = mb_read_yn("Buffer modified; kill anyway?");
+func kill_buffer_at(int $kidx, int $silent) int {
+    if ($kidx < 0 || $kidx >= buf_count()) { return 0; }
+    buf_save_state();
+    my scalar $kb = $BUFFERS->[$kidx];
+    my str $kbname = $kb->{"name"};
+    if (($kb->{"dirty"} // 0) == 1) {
+        my int $yn = mb_read_yn("Buffer " . $kbname . " modified; kill anyway?");
         if ($yn != 1) {
-            set_msg("Not killed.");
-            return;
+            if ($silent == 0) { set_msg("Not killed."); }
+            return 0;
         }
     }
-    if (buf_count() <= 1) {
-        if ($BNAME eq "*scratch*" && length($FNAME) == 0 && $DIRTY == 0 && line_count() == 1 && length(get_line(0)) == 0) {
-            set_msg("Already in empty *scratch* buffer.");
-            return;
+    my int $vtp = $kb->{"term_vt"} // 0;
+    if ($vtp != 0) {
+        if (Smacs::Term::is_alive($vtp) == 1) {
+            my int $tyn = mb_read_yn("Terminal process in " . $kbname . " is running; kill anyway?");
+            if ($tyn != 1) {
+                if ($silent == 0) { set_msg("Not killed."); }
+                return 0;
+            }
         }
-        my str $sole_killed = $BNAME;
+        Smacs::Term::destroy($vtp);
+        $kb->{"term_vt"} = 0;
+    }
+
+    if (buf_count() <= 1) {
+        if ($kbname eq "*scratch*" && length($kb->{"filename"} // "") == 0 && ($kb->{"dirty"} // 0) == 0 && ($kb->{"mode"} // "Text") eq "Text" && scalar(@{$kb->{"lines"}}) == 1 && length($kb->{"lines"}->[0]) == 0) {
+            if ($silent == 0) { set_msg("Already in empty *scratch* buffer."); }
+            return 0;
+        }
         $BUFFERS = [];
         buf_new("*scratch*", "");
         buf_load_state(0);
@@ -8078,59 +8297,1139 @@ func cmd_kill_buffer() void {
             $swi = $swi + 1;
         }
         $LAST_BUFFER = "";
-        set_msg("Killed buffer: " . $sole_killed);
-        return;
+        if ($silent == 0) { set_msg("Killed buffer: " . $kbname); }
+        return 1;
     }
-    my str $killed = $BNAME;
-    my int $killed_idx = $BUF_IDX;
-    splice(@$BUFFERS, $BUF_IDX, 1);
-    # Prefer switching to $LAST_BUFFER if it still exists
-    my int $next_idx = -1;
-    if (length($LAST_BUFFER) > 0 && $LAST_BUFFER ne $killed) {
-        $next_idx = buf_find($LAST_BUFFER);
+
+    splice(@$BUFFERS, $kidx, 1);
+    if ($kidx < $BUF_IDX) {
+        $BUF_IDX = $BUF_IDX - 1;
+    } elsif ($kidx == $BUF_IDX) {
+        my int $next_idx = -1;
+        if (length($LAST_BUFFER) > 0 && $LAST_BUFFER ne $kbname) {
+            $next_idx = buf_find($LAST_BUFFER);
+        }
+        if ($next_idx >= 0) {
+            $BUF_IDX = $next_idx;
+        } elsif ($BUF_IDX >= buf_count()) {
+            $BUF_IDX = buf_count() - 1;
+        }
     }
-    if ($next_idx >= 0) {
-        $BUF_IDX = $next_idx;
-    } elsif ($BUF_IDX >= buf_count()) {
-        $BUF_IDX = buf_count() - 1;
-    }
-    if ($LAST_BUFFER eq $killed) {
+    if ($LAST_BUFFER eq $kbname) {
         $LAST_BUFFER = "";
     }
     my int $wi = 0;
     while ($wi < $WIN_COUNT) {
         my scalar $w = $WINDOWS->[$wi];
         my int $wb = $w->{"buf_idx"};
-        if ($wb == $killed_idx) {
+        if ($wb == $kidx) {
             $w->{"buf_idx"} = $BUF_IDX;
             my scalar $nb = $BUFFERS->[$BUF_IDX];
             $w->{"cy"} = $nb->{"cy"};
             $w->{"cx"} = $nb->{"cx"};
             $w->{"sy"} = $nb->{"sy"};
             $w->{"sx"} = $nb->{"sx"};
-        } elsif ($wb > $killed_idx) {
+        } elsif ($wb > $kidx) {
             $w->{"buf_idx"} = $wb - 1;
         }
         $wi = $wi + 1;
     }
     buf_load_state($BUF_IDX);
-    set_msg("Killed buffer: " . $killed);
+    if ($silent == 0) {
+        set_msg("Killed buffer: " . $kbname);
+    }
+    return 1;
+}
+
+func cmd_kill_buffer() void {
+    kill_buffer_at($BUF_IDX, 0);
+}
+
+# ===========================================================================
+# Interactive *Buffers* (BufferMenu)
+# ===========================================================================
+
+func bmenu_rebuild_lines(str $prefer_bname) void {
+    buf_save_state();
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my scalar $old_entries = $buf->{"bmenu_entries"};
+    my scalar $del_map = {};
+    if (defined($old_entries)) {
+        my int $oi = 0;
+        while ($oi < scalar(@$old_entries)) {
+            my scalar $oe = $old_entries->[$oi];
+            if (($oe->{"del"} // 0) == 1) {
+                $del_map->{$oe->{"name"}} = 1;
+            }
+            $oi = $oi + 1;
+        }
+    }
+
+    my str $cur_row_bname = $prefer_bname;
+    if (length($cur_row_bname) == 0 && defined($old_entries) && $CY >= 2 && ($CY - 2) < scalar(@$old_entries)) {
+        $cur_row_bname = $old_entries->[$CY - 2]->{"name"};
+    }
+
+    my scalar $new_entries = [];
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        my str $nm = $BUFFERS->[$bi]->{"name"};
+        if ($nm ne "*Buffers*") {
+            my scalar $item = {};
+            $item->{"name"} = $nm;
+            $item->{"del"} = $del_map->{$nm} // 0;
+            push(@$new_entries, $item);
+        }
+        $bi = $bi + 1;
+    }
+    # Place *Buffers* itself at the bottom
+    my scalar $self_item = {};
+    $self_item->{"name"} = "*Buffers*";
+    $self_item->{"del"} = $del_map->{"*Buffers*"} // 0;
+    push(@$new_entries, $self_item);
+
+    $buf->{"bmenu_entries"} = $new_entries;
+    my str $origin = $buf->{"bmenu_origin"} // "";
+    my scalar $lines = Smacs::Browser::format_buffer_menu_lines($new_entries, $BUFFERS, $origin);
+    $buf->{"lines"} = $lines;
+    $buf->{"generation"} = ($buf->{"generation"} // 0) + 1;
+    $buf->{"highlight_cache"} = {};
+    $CL = $lines;
+    $LINES_SHARED = 0;
+
+    my int $target_cy = 2;
+    if (length($cur_row_bname) > 0) {
+        my int $ei = 0;
+        while ($ei < scalar(@$new_entries)) {
+            if ($new_entries->[$ei]->{"name"} eq $cur_row_bname) {
+                $target_cy = 2 + $ei;
+                last;
+            }
+            $ei = $ei + 1;
+        }
+    }
+    $CY = $target_cy;
+    if ($CY >= line_count()) { $CY = line_count() - 1; }
+    if ($CY < 0) { $CY = 0; }
+    $CX = 4;
+    clamp_cursor();
+    scroll_adjust();
+    buf_save_state();
 }
 
 func cmd_list_buffers() void {
-    my str $list = "Buffers: ";
+    my str $prev = $BNAME;
+    buf_save_state();
+    win_save_state();
+    my int $idx = buf_find("*Buffers*");
+    if ($idx < 0) {
+        buf_new("*Buffers*", "");
+        $idx = buf_count() - 1;
+    }
+    my scalar $mbuf = $BUFFERS->[$idx];
+    $mbuf->{"mode"} = "BufferMenu";
+    $mbuf->{"syntax"} = "";
+    $mbuf->{"filename"} = "";
+    $mbuf->{"dirty"} = 0;
+    $mbuf->{"undo"} = [];
+    $mbuf->{"redo"} = [];
+    if ($prev ne "*Buffers*") {
+        $mbuf->{"bmenu_origin"} = $prev;
+        $LAST_BUFFER = $prev;
+    }
+    buf_load_state($idx);
+    my scalar $cw = $WINDOWS->[$WIN_IDX];
+    $cw->{"buf_idx"} = $BUF_IDX;
+    bmenu_rebuild_lines($mbuf->{"bmenu_origin"} // "");
+    set_msg("RET:switch  o:other-win  s:save  d:mark-del  u:unmark  x:kill-marked  g:refresh  q:quit");
+}
+
+func bmenu_selected_entry() scalar {
+    my scalar $entries = $BUFFERS->[$BUF_IDX]->{"bmenu_entries"};
+    if (!defined($entries)) { return undef; }
+    my int $eidx = $CY - 2;
+    if ($eidx < 0 || $eidx >= scalar(@$entries)) { return undef; }
+    return $entries->[$eidx];
+}
+
+func bmenu_save_selected() void {
+    my scalar $ent = bmenu_selected_entry();
+    if (!defined($ent)) {
+        set_msg("Move cursor onto a buffer line.");
+        return;
+    }
+    my str $tname = $ent->{"name"};
+    my int $tidx = buf_find($tname);
+    if ($tidx < 0) { return; }
+    my str $tmode = $BUFFERS->[$tidx]->{"mode"} // "Text";
+    if ($tmode eq "BufferMenu" || $tmode eq "Dired" || $tmode eq "Help" || $tmode eq "Term" || $tmode eq "Term-Copy") {
+        set_msg("Buffer " . $tname . " is not a file-backed text buffer.");
+        return;
+    }
+
+    my int $saved_cy = $CY;
+    my int $saved_sy = $SY;
+    buf_save_state();
+    buf_load_state($tidx);
+    file_save();
+    my str $save_msg = $MSG;
+    my str $after_name = $BNAME;
+    buf_save_state();
+
+    my int $bm_idx = buf_find("*Buffers*");
+    if ($bm_idx >= 0) {
+        buf_load_state($bm_idx);
+        $WINDOWS->[$WIN_IDX]->{"buf_idx"} = $BUF_IDX;
+        bmenu_rebuild_lines($after_name);
+        $CY = $saved_cy;
+        $SY = $saved_sy;
+        clamp_cursor();
+        $CX = 4;
+        scroll_adjust();
+    }
+    set_msg($save_msg);
+}
+
+func bmenu_execute_marks() void {
+    my scalar $entries = $BUFFERS->[$BUF_IDX]->{"bmenu_entries"};
+    if (!defined($entries)) { return; }
+    my array @to_kill = ();
     my int $i = 0;
-    while ($i < buf_count()) {
-        my scalar $b = $BUFFERS->[$i];
-        if ($i > 0) { $list = $list . " | "; }
-        if ($i == $BUF_IDX) {
-            $list = $list . "[" . $b->{"name"} . "]";
-        } else {
-            $list = $list . $b->{"name"};
+    while ($i < scalar(@$entries)) {
+        if (($entries->[$i]->{"del"} // 0) == 1) {
+            push(@to_kill, $entries->[$i]->{"name"});
         }
         $i = $i + 1;
     }
-    set_msg($list);
+    if (scalar(@to_kill) == 0) {
+        set_msg("No buffers marked for deletion (press d to mark).");
+        return;
+    }
+    my int $killed_count = 0;
+    my int $ki = 0;
+    while ($ki < scalar(@to_kill)) {
+        my str $kn = $to_kill[$ki];
+        my int $kidx = buf_find($kn);
+        if ($kidx >= 0) {
+            if (kill_buffer_at($kidx, 1) == 1) {
+                $killed_count = $killed_count + 1;
+            }
+        }
+        $ki = $ki + 1;
+    }
+    my int $bm_idx = buf_find("*Buffers*");
+    if ($bm_idx >= 0 && $BUF_IDX == $bm_idx) {
+        bmenu_rebuild_lines("");
+    }
+    set_msg("Killed " . $killed_count . " buffer(s).");
+}
+
+func bmenu_handle_key(str $key) int {
+    if ($key eq "q") { cmd_kill_buffer(); return 1; }
+    if ($key eq "g") {
+        bmenu_rebuild_lines("");
+        set_msg("Buffer list refreshed.");
+        return 1;
+    }
+    if ($key eq "n" || $key eq " " || $key eq "DOWN" || $key eq "C-n") {
+        if ($CY < 2 && line_count() > 2) { $CY = 2; }
+        elsif ($CY < line_count() - 1) { $CY = $CY + 1; }
+        $CX = 4;
+        return 1;
+    }
+    if ($key eq "p" || $key eq "UP" || $key eq "C-p") {
+        if ($CY > 2) { $CY = $CY - 1; }
+        elsif (line_count() > 2) { $CY = 2; }
+        $CX = 4;
+        return 1;
+    }
+    if ($key eq "RET" || $key eq "f" || $key eq "e") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a buffer line."); return 1; }
+        my int $tidx = buf_find($ent->{"name"});
+        if ($tidx >= 0) {
+            switch_to_buffer_idx($tidx, 0, 0);
+            set_msg("Buffer: " . $BNAME);
+        }
+        return 1;
+    }
+    if ($key eq "o") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a buffer line."); return 1; }
+        my int $tidx = buf_find($ent->{"name"});
+        if ($tidx >= 0) {
+            switch_to_buffer_idx($tidx, 1, 0);
+            set_msg("Buffer: " . $BNAME);
+        }
+        return 1;
+    }
+    if ($key eq "C-o") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { return 1; }
+        my int $tidx = buf_find($ent->{"name"});
+        if ($tidx >= 0) {
+            switch_to_buffer_idx($tidx, 1, 1);
+            set_msg("Displayed in other window: " . $ent->{"name"});
+        }
+        return 1;
+    }
+    if ($key eq "s") {
+        bmenu_save_selected();
+        return 1;
+    }
+    if ($key eq "d" || $key eq "k" || $key eq "C-d") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a buffer line."); return 1; }
+        $ent->{"del"} = 1;
+        my int $next_cy = ($CY < line_count() - 1) ? ($CY + 1) : $CY;
+        bmenu_rebuild_lines("");
+        $CY = $next_cy;
+        clamp_cursor();
+        $CX = 4;
+        return 1;
+    }
+    if ($key eq "D") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a buffer line."); return 1; }
+        my int $kidx = buf_find($ent->{"name"});
+        if ($kidx >= 0) {
+            kill_buffer_at($kidx, 0);
+            if ($MODE eq "BufferMenu") {
+                bmenu_rebuild_lines("");
+            }
+        }
+        return 1;
+    }
+    if ($key eq "u") {
+        my scalar $ent = bmenu_selected_entry();
+        if (!defined($ent)) { return 1; }
+        $ent->{"del"} = 0;
+        my int $next_cy = ($CY < line_count() - 1) ? ($CY + 1) : $CY;
+        bmenu_rebuild_lines("");
+        $CY = $next_cy;
+        clamp_cursor();
+        $CX = 4;
+        return 1;
+    }
+    if ($key eq "BACKSPACE") {
+        if ($CY > 2) { $CY = $CY - 1; }
+        my scalar $ent = bmenu_selected_entry();
+        if (defined($ent)) {
+            $ent->{"del"} = 0;
+            my int $cur_cy = $CY;
+            bmenu_rebuild_lines("");
+            $CY = $cur_cy;
+            clamp_cursor();
+            $CX = 4;
+        }
+        return 1;
+    }
+    if ($key eq "U") {
+        my scalar $entries = $BUFFERS->[$BUF_IDX]->{"bmenu_entries"};
+        if (defined($entries)) {
+            my int $ui = 0;
+            while ($ui < scalar(@$entries)) {
+                $entries->[$ui]->{"del"} = 0;
+                $ui = $ui + 1;
+            }
+            bmenu_rebuild_lines("");
+            set_msg("All marks cleared.");
+        }
+        return 1;
+    }
+    if ($key eq "x") {
+        bmenu_execute_marks();
+        return 1;
+    }
+    return 0;
+}
+
+# ===========================================================================
+# Dired Directory Browser
+# ===========================================================================
+
+func uniquify_dired_name(int $target_idx, str $cdir) str {
+    my str $raw = "/";
+    if ($cdir ne "/") {
+        $raw = path_basename($cdir) . "/";
+    }
+    $BUFFERS->[$target_idx]->{"raw_bname"} = $raw;
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        if ($bi != $target_idx && ($BUFFERS->[$bi]->{"raw_bname"} // "") eq $raw) {
+            my str $pdir = path_basename(Smacs::File::dirname($cdir));
+            if (length($pdir) > 0 && $pdir ne "/") {
+                return $raw . "<" . $pdir . ">";
+            }
+        }
+        $bi = $bi + 1;
+    }
+    return $raw;
+}
+
+func dired_populate_current(str $dir, str $focus_name) void {
+    my str $cdir = Smacs::Browser::clean_dir_path($dir);
+    my scalar $dh = core::opendir($cdir);
+    if (!defined($dh)) {
+        set_msg("Cannot read directory: " . $cdir);
+        return;
+    }
+    core::closedir($dh);
+
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    my int $show_hidden = $buf->{"dired_show_hidden"} // 1;
+
+    # Preserve existing delete marks if refreshing the same directory
+    my scalar $del_set = {};
+    my str $cur_entry_name = $focus_name;
+    if (($buf->{"dired_dir"} // "") eq $cdir && defined($buf->{"dired_entries"})) {
+        my scalar $old_e = $buf->{"dired_entries"};
+        if (length($cur_entry_name) == 0 && $CY >= 2 && ($CY - 2) < scalar(@$old_e)) {
+            $cur_entry_name = $old_e->[$CY - 2]->{"name"};
+        }
+        my int $oi = 0;
+        while ($oi < scalar(@$old_e)) {
+            if (($old_e->[$oi]->{"del"} // 0) == 1) {
+                $del_set->{$old_e->[$oi]->{"name"}} = 1;
+            }
+            $oi = $oi + 1;
+        }
+    }
+
+    my scalar $entries = Smacs::Browser::read_directory($cdir, $show_hidden);
+    my int $ei = 0;
+    while ($ei < scalar(@$entries)) {
+        my str $enm = $entries->[$ei]->{"name"};
+        if (($del_set->{$enm} // 0) == 1) {
+            $entries->[$ei]->{"del"} = 1;
+        }
+        $ei = $ei + 1;
+    }
+
+    my scalar $lines = Smacs::Browser::format_dired_lines($cdir, $entries, $show_hidden);
+    my str $dname = uniquify_dired_name($BUF_IDX, $cdir);
+
+    $buf->{"dired_dir"} = $cdir;
+    $buf->{"dired_entries"} = $entries;
+    $buf->{"lines"} = $lines;
+    $buf->{"generation"} = ($buf->{"generation"} // 0) + 1;
+    $buf->{"highlight_cache"} = {};
+    $CL = $lines;
+    $LINES_SHARED = 0;
+    $LARGE_MODE = 0;
+    $LF_STATE = undef;
+    $HEX_MODE = 0;
+    $DIRTY = 0;
+    $FNAME = "";
+    $BNAME = $dname;
+    $SYNTAX = "";
+    $MODE = "Dired";
+    $UNDO = [];
+    $REDO = [];
+    $MSET = 0;
+    $SHIFT_MARK = 0;
+
+    my int $target_cy = (scalar(@$entries) > 1) ? 3 : 2;
+    if (length($cur_entry_name) > 0) {
+        my int $fi = 0;
+        while ($fi < scalar(@$entries)) {
+            if ($entries->[$fi]->{"name"} eq $cur_entry_name) {
+                $target_cy = 2 + $fi;
+                last;
+            }
+            $fi = $fi + 1;
+        }
+    }
+    $CY = $target_cy;
+    if ($CY >= line_count()) { $CY = line_count() - 1; }
+    if ($CY < 0) { $CY = 0; }
+    $CX = 41;
+    clamp_cursor();
+    scroll_adjust();
+    buf_save_state();
+}
+
+func dired_open_in_current_buffer(str $dir, str $focus_name) void {
+    dired_populate_current($dir, $focus_name);
+    if ($MODE eq "Dired") {
+        set_msg("Dired: " . ($BUFFERS->[$BUF_IDX]->{"dired_dir"} // $dir));
+    }
+}
+
+func dired_refresh(str $focus_name) void {
+    my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+    if (length($cdir) > 0) {
+        dired_populate_current($cdir, $focus_name);
+    }
+}
+
+func dired_open(str $dir, str $focus_name, int $other_win, int $keep_focus) void {
+    my str $cdir = Smacs::Browser::clean_dir_path(expand_tilde($dir));
+    my scalar $dh = core::opendir($cdir);
+    if (!defined($dh)) {
+        set_msg("Cannot open directory: " . $cdir);
+        return;
+    }
+    core::closedir($dh);
+
+    # Check if already open in an existing Dired buffer
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        my scalar $b = $BUFFERS->[$bi];
+        if (($b->{"mode"} // "") eq "Dired" && ($b->{"dired_dir"} // "") eq $cdir) {
+            my int $orig_win = $WIN_IDX;
+            switch_to_buffer_idx($bi, $other_win, 0);
+            dired_populate_current($cdir, $focus_name);
+            $WINDOWS->[$WIN_IDX]->{"cy"} = $CY;
+            $WINDOWS->[$WIN_IDX]->{"cx"} = $CX;
+            $WINDOWS->[$WIN_IDX]->{"sy"} = $SY;
+            $WINDOWS->[$WIN_IDX]->{"sx"} = $SX;
+            if ($other_win == 1 && $keep_focus == 1) {
+                win_load_state($orig_win);
+            }
+            set_msg("Dired: " . $cdir);
+            return;
+        }
+        $bi = $bi + 1;
+    }
+
+    my int $orig_win2 = $WIN_IDX;
+    my str $prev = $BNAME;
+    if ($other_win == 1) {
+        if ($WIN_COUNT <= 1) { win_split(); }
+        win_other();
+    }
+    buf_save_state();
+    win_save_state();
+    buf_new(path_basename($cdir) . "/", "");
+    buf_load_state(buf_count() - 1);
+    dired_open_in_current_buffer($cdir, $focus_name);
+    my scalar $cw = $WINDOWS->[$WIN_IDX];
+    $cw->{"buf_idx"} = $BUF_IDX;
+    $cw->{"cy"} = $CY;
+    $cw->{"cx"} = $CX;
+    $cw->{"sy"} = $SY;
+    $cw->{"sx"} = $SX;
+    if ($prev ne $BNAME) { $LAST_BUFFER = $prev; }
+    if ($other_win == 1 && $keep_focus == 1) {
+        win_load_state($orig_win2);
+    }
+}
+
+func cmd_dired() void {
+    my str $path = mb_read_file_ex("Dired (directory): ", 1);
+    if ($MB_CANCELLED == 1 || length($path) == 0) { return; }
+    $path = expand_tilde($path);
+    if (is_directory($path) == 1) {
+        dired_open($path, "", 0, 0);
+    } else {
+        dired_open(path_dirname($path), path_basename($path), 0, 0);
+    }
+}
+
+func cmd_dired_jump() void {
+    if ($MODE eq "Dired") {
+        my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // core::getcwd();
+        if ($cdir ne "/") {
+            dired_populate_current(Smacs::File::dirname($cdir), path_basename($cdir));
+            set_msg("Dired: " . ($BUFFERS->[$BUF_IDX]->{"dired_dir"} // ""));
+        }
+        return;
+    }
+    if (length($FNAME) > 0) {
+        dired_open(path_dirname($FNAME), path_basename($FNAME), 0, 0);
+    } else {
+        dired_open(core::getcwd(), "", 0, 0);
+    }
+}
+
+func dired_selected_entry() scalar {
+    my scalar $entries = $BUFFERS->[$BUF_IDX]->{"dired_entries"};
+    if (!defined($entries)) { return undef; }
+    my int $eidx = $CY - 2;
+    if ($eidx < 0 || $eidx >= scalar(@$entries)) { return undef; }
+    return $entries->[$eidx];
+}
+
+func dired_delete_one_path(scalar $ent) str {
+    my str $fp = $ent->{"full_path"};
+    if (($ent->{"is_dir"} // 0) == 1 && ($ent->{"is_link"} // 0) == 0) {
+        if (core::rmdir($fp) != 0) {
+            return Smacs::File::error_text("Cannot remove directory " . $ent->{"name"});
+        }
+        return "";
+    }
+    if (core::unlink($fp) != 0) {
+        return Smacs::File::error_text("Cannot delete " . $ent->{"name"});
+    }
+    return "";
+}
+
+func dired_handle_key(str $key) int {
+    if ($key eq "q") { cmd_kill_buffer(); return 1; }
+    if ($key eq "g") {
+        dired_refresh("");
+        set_msg("Directory refreshed.");
+        return 1;
+    }
+    if ($key eq ".") {
+        my scalar $buf = $BUFFERS->[$BUF_IDX];
+        my int $sh = ($buf->{"dired_show_hidden"} // 1) == 1 ? 0 : 1;
+        $buf->{"dired_show_hidden"} = $sh;
+        dired_refresh("");
+        set_msg(($sh == 1) ? "Showing hidden dotfiles." : "Hiding dotfiles.");
+        return 1;
+    }
+    if ($key eq "n" || $key eq " " || $key eq "DOWN" || $key eq "C-n") {
+        if ($CY < 2 && line_count() > 2) { $CY = 2; }
+        elsif ($CY < line_count() - 1) { $CY = $CY + 1; }
+        $CX = 41;
+        clamp_cursor();
+        return 1;
+    }
+    if ($key eq "p" || $key eq "UP" || $key eq "C-p") {
+        if ($CY > 2) { $CY = $CY - 1; }
+        elsif (line_count() > 2) { $CY = 2; }
+        $CX = 41;
+        clamp_cursor();
+        return 1;
+    }
+    if ($key eq "^") {
+        my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        if (length($cdir) > 0 && $cdir ne "/") {
+            my str $child = path_basename($cdir);
+            dired_populate_current(Smacs::File::dirname($cdir), $child);
+            set_msg("Dired: " . ($BUFFERS->[$BUF_IDX]->{"dired_dir"} // ""));
+        } else {
+            set_msg("Already at root directory /");
+        }
+        return 1;
+    }
+    if ($key eq "RET" || $key eq "f" || $key eq "e") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a directory entry."); return 1; }
+        if (($ent->{"is_dir"} // 0) == 1) {
+            my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+            my str $focus = "";
+            if ($ent->{"name"} eq ".." && $cdir ne "/") {
+                $focus = path_basename($cdir);
+            }
+            dired_populate_current($ent->{"full_path"}, $focus);
+            set_msg("Dired: " . ($BUFFERS->[$BUF_IDX]->{"dired_dir"} // ""));
+        } else {
+            open_file_target($ent->{"full_path"}, 0, 0, 0);
+        }
+        return 1;
+    }
+    if ($key eq "L") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { return 1; }
+        if (($ent->{"is_dir"} // 0) == 1) {
+            set_msg("Entry is a directory.");
+            return 1;
+        }
+        open_file_target($ent->{"full_path"}, 1, 0, 0);
+        return 1;
+    }
+    if ($key eq "o") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { set_msg("Move cursor onto a directory entry."); return 1; }
+        open_file_target($ent->{"full_path"}, 0, 1, 0);
+        return 1;
+    }
+    if ($key eq "C-o") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { return 1; }
+        open_file_target($ent->{"full_path"}, 0, 1, 1);
+        return 1;
+    }
+    if ($key eq "+") {
+        my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // core::getcwd();
+        my str $nm = mb_read("Create directory in " . $cdir . ": ");
+        if ($MB_CANCELLED == 1 || length(trim($nm)) == 0) { return 1; }
+        $nm = expand_tilde(trim($nm));
+        my str $full = (substr($nm, 0, 1) eq "/") ? $nm : Smacs::Browser::join_dir_entry($cdir, $nm);
+        if (core::mkdir($full, 0777) != 0) {
+            set_msg(Smacs::File::error_text("mkdir failed"));
+            return 1;
+        }
+        dired_refresh(path_basename($full));
+        set_msg("Created directory: " . $full);
+        return 1;
+    }
+    if ($key eq "R") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent) || $ent->{"name"} eq "..") {
+            set_msg("Cannot rename '..'");
+            return 1;
+        }
+        my str $src = $ent->{"full_path"};
+        my str $dst = mb_read_file_ex("Rename " . $ent->{"name"} . " to: ", 1);
+        if ($MB_CANCELLED == 1 || length(trim($dst)) == 0) { return 1; }
+        $dst = expand_tilde(trim($dst));
+        if (is_directory($dst) == 1) {
+            $dst = Smacs::Browser::join_dir_entry(Smacs::Browser::clean_dir_path($dst), $ent->{"name"});
+        }
+        if (same_file_path($src, $dst) == 1) {
+            set_msg("Source and destination are the same.");
+            return 1;
+        }
+        if (file_exists($dst) == 1) {
+            if (mb_read_yn("Overwrite existing " . $dst . "?") != 1) {
+                set_msg("Rename cancelled.");
+                return 1;
+            }
+        }
+        if (core::rename($src, $dst) != 0) {
+            set_msg(Smacs::File::error_text("Rename failed"));
+            return 1;
+        }
+        # Update any open buffer pointing to $src
+        my int $bi = 0;
+        while ($bi < buf_count()) {
+            if (same_file_path($BUFFERS->[$bi]->{"filename"} // "", $src) == 1) {
+                $BUFFERS->[$bi]->{"filename"} = $dst;
+                $BUFFERS->[$bi]->{"name"} = uniquify_buffer_name($bi, $dst);
+            }
+            $bi = $bi + 1;
+        }
+        dired_refresh(path_basename($dst));
+        set_msg("Renamed to " . $dst);
+        return 1;
+    }
+    if ($key eq "C") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent) || ($ent->{"is_dir"} // 0) == 1) {
+            set_msg("Move cursor onto a regular file to copy.");
+            return 1;
+        }
+        my str $src = $ent->{"full_path"};
+        my str $dst = mb_read_file_ex("Copy " . $ent->{"name"} . " to: ", 1);
+        if ($MB_CANCELLED == 1 || length(trim($dst)) == 0) { return 1; }
+        $dst = expand_tilde(trim($dst));
+        if (is_directory($dst) == 1) {
+            $dst = Smacs::Browser::join_dir_entry(Smacs::Browser::clean_dir_path($dst), $ent->{"name"});
+        }
+        if (same_file_path($src, $dst) == 1) {
+            set_msg("Source and destination are the same.");
+            return 1;
+        }
+        if (file_exists($dst) == 1) {
+            if (mb_read_yn("Overwrite existing " . $dst . "?") != 1) {
+                set_msg("Copy cancelled.");
+                return 1;
+            }
+        }
+        my str $cerr = Smacs::Browser::copy_file_streaming($src, $dst);
+        if (length($cerr) > 0) {
+            set_msg($cerr);
+            return 1;
+        }
+        dired_refresh(path_basename($dst));
+        set_msg("Copied to " . $dst);
+        return 1;
+    }
+    if ($key eq "d") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { return 1; }
+        if ($ent->{"name"} eq "..") {
+            set_msg("Cannot mark '..' for deletion.");
+            return 1;
+        }
+        $ent->{"del"} = 1;
+        my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        my int $sh = $BUFFERS->[$BUF_IDX]->{"dired_show_hidden"} // 1;
+        my scalar $lines = Smacs::Browser::format_dired_lines($cdir, $BUFFERS->[$BUF_IDX]->{"dired_entries"}, $sh);
+        $BUFFERS->[$BUF_IDX]->{"lines"} = $lines;
+        $CL = $lines;
+        note_buffer_changed();
+        if ($CY < line_count() - 1) { $CY = $CY + 1; }
+        $CX = 41;
+        clamp_cursor();
+        return 1;
+    }
+    if ($key eq "u") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent)) { return 1; }
+        $ent->{"del"} = 0;
+        my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        my int $sh = $BUFFERS->[$BUF_IDX]->{"dired_show_hidden"} // 1;
+        my scalar $lines = Smacs::Browser::format_dired_lines($cdir, $BUFFERS->[$BUF_IDX]->{"dired_entries"}, $sh);
+        $BUFFERS->[$BUF_IDX]->{"lines"} = $lines;
+        $CL = $lines;
+        note_buffer_changed();
+        if ($CY < line_count() - 1) { $CY = $CY + 1; }
+        $CX = 41;
+        clamp_cursor();
+        return 1;
+    }
+    if ($key eq "BACKSPACE") {
+        if ($CY > 2) { $CY = $CY - 1; }
+        my scalar $ent = dired_selected_entry();
+        if (defined($ent)) {
+            $ent->{"del"} = 0;
+            my str $cdir = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+            my int $sh = $BUFFERS->[$BUF_IDX]->{"dired_show_hidden"} // 1;
+            my scalar $lines = Smacs::Browser::format_dired_lines($cdir, $BUFFERS->[$BUF_IDX]->{"dired_entries"}, $sh);
+            $BUFFERS->[$BUF_IDX]->{"lines"} = $lines;
+            $CL = $lines;
+            note_buffer_changed();
+            $CX = 41;
+            clamp_cursor();
+        }
+        return 1;
+    }
+    if ($key eq "U") {
+        my scalar $entries = $BUFFERS->[$BUF_IDX]->{"dired_entries"};
+        if (defined($entries)) {
+            my int $ui = 0;
+            while ($ui < scalar(@$entries)) {
+                $entries->[$ui]->{"del"} = 0;
+                $ui = $ui + 1;
+            }
+            dired_refresh("");
+            set_msg("All marks cleared.");
+        }
+        return 1;
+    }
+    if ($key eq "D") {
+        my scalar $ent = dired_selected_entry();
+        if (!defined($ent) || $ent->{"name"} eq "..") {
+            set_msg("Cannot delete '..'");
+            return 1;
+        }
+        if (mb_read_yn("Delete " . $ent->{"name"} . "?") != 1) {
+            set_msg("Delete cancelled.");
+            return 1;
+        }
+        my str $derr = dired_delete_one_path($ent);
+        dired_refresh("");
+        if (length($derr) > 0) { set_msg($derr); }
+        else { set_msg("Deleted " . $ent->{"name"}); }
+        return 1;
+    }
+    if ($key eq "x") {
+        my scalar $entries = $BUFFERS->[$BUF_IDX]->{"dired_entries"};
+        if (!defined($entries)) { return 1; }
+        my scalar $marked = [];
+        my str $names_preview = "";
+        my int $mi = 0;
+        while ($mi < scalar(@$entries)) {
+            if (($entries->[$mi]->{"del"} // 0) == 1) {
+                push(@$marked, $entries->[$mi]);
+                if (scalar(@$marked) <= 3) {
+                    if (length($names_preview) > 0) { $names_preview = $names_preview . ", "; }
+                    $names_preview = $names_preview . $entries->[$mi]->{"name"};
+                }
+            }
+            $mi = $mi + 1;
+        }
+        my int $mcnt = scalar(@$marked);
+        if ($mcnt == 0) {
+            set_msg("No entries marked for deletion (press d to mark).");
+            return 1;
+        }
+        if ($mcnt > 3) { $names_preview = $names_preview . ", ..."; }
+        if (mb_read_yn("Delete " . $mcnt . " marked item(s) [" . $names_preview . "]?") != 1) {
+            set_msg("Delete cancelled.");
+            return 1;
+        }
+        my int $ok = 0;
+        my str $first_err = "";
+        my int $di = 0;
+        while ($di < $mcnt) {
+            my str $err = dired_delete_one_path($marked->[$di]);
+            if (length($err) == 0) {
+                $ok = $ok + 1;
+            } elsif (length($first_err) == 0) {
+                $first_err = $err;
+            }
+            $di = $di + 1;
+        }
+        dired_refresh("");
+        if (length($first_err) > 0) {
+            set_msg("Deleted " . $ok . "/" . $mcnt . " (" . $first_err . ")");
+        } else {
+            set_msg("Deleted " . $ok . " item(s).");
+        }
+        return 1;
+    }
+    return 0;
+}
+
+# ===========================================================================
+# Embedded Terminal Session Buffers (M-x create-terminal)
+# ===========================================================================
+
+func next_terminal_buffer_name() str {
+    if (buf_find("*terminal*") < 0) {
+        return "*terminal*";
+    }
+    my int $n = 2;
+    while (1) {
+        my str $cand = "*terminal<" . $n . ">*";
+        if (buf_find($cand) < 0) {
+            return $cand;
+        }
+        $n = $n + 1;
+    }
+    return "*terminal*";
+}
+
+func cmd_create_terminal() void {
+    my str $cwd = core::getcwd();
+    if ($MODE eq "Dired") {
+        my str $dd = $BUFFERS->[$BUF_IDX]->{"dired_dir"} // "";
+        if (length($dd) > 0) { $cwd = $dd; }
+    } elsif (length($FNAME) > 0) {
+        my str $fd = path_dirname($FNAME);
+        if (length($fd) > 0 && $fd ne ".") { $cwd = $fd; }
+    }
+
+    my int $r = win_edit_rows();
+    my int $c = $WINDOWS->[$WIN_IDX]->{"width"};
+    if ($r < 2) { $r = 24; }
+    if ($c < 4) { $c = 80; }
+
+    my int $vt = Smacs::Term::spawn($r, $c, "", $cwd);
+    if ($vt == 0) {
+        set_msg("Failed to spawn PTY terminal session.");
+        return;
+    }
+
+    my str $prev = $BNAME;
+    my str $tname = next_terminal_buffer_name();
+    buf_save_state();
+    win_save_state();
+    buf_new($tname, "");
+    my int $tidx = buf_count() - 1;
+    my scalar $tbuf = $BUFFERS->[$tidx];
+    $tbuf->{"mode"} = "Term";
+    $tbuf->{"syntax"} = "";
+    $tbuf->{"dirty"} = 0;
+    $tbuf->{"term_vt"} = $vt;
+    $tbuf->{"term_cwd"} = $cwd;
+    buf_load_state($tidx);
+    my scalar $cw = $WINDOWS->[$WIN_IDX];
+    $cw->{"buf_idx"} = $BUF_IDX;
+    if ($prev ne $BNAME) { $LAST_BUFFER = $prev; }
+    set_msg("Terminal " . $tname . " started in " . $cwd . " (C-x for editor commands, C-x [ for scroll/copy)");
+}
+
+func term_enter_copy_mode() void {
+    my int $vt = $BUFFERS->[$BUF_IDX]->{"term_vt"} // 0;
+    if ($vt == 0) { return; }
+    my scalar $lines = Smacs::Term::snapshot_lines($vt);
+    if (scalar(@$lines) == 0) { push(@$lines, ""); }
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $buf->{"lines"} = $lines;
+    $buf->{"generation"} = ($buf->{"generation"} // 0) + 1;
+    $buf->{"highlight_cache"} = {};
+    $CL = $lines;
+    $LINES_SHARED = 0;
+    $MODE = "Term-Copy";
+    $buf->{"mode"} = "Term-Copy";
+    $CY = line_count() - 1;
+    $CX = 0;
+    $MSET = 0;
+    $SHIFT_MARK = 0;
+    scroll_adjust();
+    buf_save_state();
+    set_msg("Terminal Copy/Scroll mode: arrows/PgUp/C-s/C-SPC/M-w to copy; press q or i to resume terminal");
+}
+
+func term_leave_copy_mode() void {
+    my scalar $buf = $BUFFERS->[$BUF_IDX];
+    $MODE = "Term";
+    $buf->{"mode"} = "Term";
+    $MSET = 0;
+    $SHIFT_MARK = 0;
+    buf_save_state();
+    set_msg("Resumed live terminal input.");
+}
+
+func term_key_to_bytes(int $vt, str $key) str {
+    my int $app = Smacs::Term::app_cursor_keys($vt);
+    if ($key eq "RET") { return "\r"; }
+    if ($key eq "TAB") { return "\t"; }
+    if ($key eq "BACKSPACE") { return core::pack("C", 127); }
+    if ($key eq "DEL") { return $E . "[3~"; }
+    if ($key eq "ESC") { return $E; }
+    if ($key eq "UP") { return ($app == 1) ? ($E . "OA") : ($E . "[A"); }
+    if ($key eq "DOWN") { return ($app == 1) ? ($E . "OB") : ($E . "[B"); }
+    if ($key eq "RIGHT") { return ($app == 1) ? ($E . "OC") : ($E . "[C"); }
+    if ($key eq "LEFT") { return ($app == 1) ? ($E . "OD") : ($E . "[D"); }
+    if ($key eq "HOME") { return ($app == 1) ? ($E . "OH") : ($E . "[H"); }
+    if ($key eq "END") { return ($app == 1) ? ($E . "OF") : ($E . "[F"); }
+    if ($key eq "PGUP") { return $E . "[5~"; }
+    if ($key eq "PGDN") { return $E . "[6~"; }
+    if ($key eq "M-UP") { return $E . "[1;3A"; }
+    if ($key eq "M-DOWN") { return $E . "[1;3B"; }
+    if ($key eq "M-RIGHT") { return $E . "[1;3C"; }
+    if ($key eq "M-LEFT") { return $E . "[1;3D"; }
+    if ($key eq "C-UP") { return $E . "[1;5A"; }
+    if ($key eq "C-DOWN") { return $E . "[1;5B"; }
+    if ($key eq "C-RIGHT") { return $E . "[1;5C"; }
+    if ($key eq "C-LEFT") { return $E . "[1;5D"; }
+    if ($key eq "M-TAB") { return $E . "\t"; }
+    if ($key eq "M-BACKSPACE") { return $E . core::pack("C", 127); }
+    if ($key eq "C- ") { return core::pack("C", 0); }
+    if ($key eq "C-_") { return core::pack("C", 31); }
+    if ($key eq "PASTE") {
+        my str $p = $PASTE_BUF;
+        $PASTE_BUF = "";
+        if (Smacs::Term::bracketed_paste_enabled($vt) == 1) {
+            return $E . "[200~" . $p . $E . "[201~";
+        }
+        return $p;
+    }
+    if (length($key) == 3 && substr($key, 0, 2) eq "C-") {
+        my int $cc = ord(substr($key, 2, 1));
+        if ($cc >= 97 && $cc <= 122) {
+            return core::pack("C", $cc - 96);
+        }
+    }
+    if (length($key) == 3 && substr($key, 0, 2) eq "M-") {
+        return $E . substr($key, 2, 1);
+    }
+    if (length($key) == 1) {
+        return $key;
+    }
+    if (length($key) > 1 && core::get_byte($key, 0) >= 128) {
+        return $key;
+    }
+    return "";
+}
+
+func term_handle_key(str $key) void {
+    my int $vt = $BUFFERS->[$BUF_IDX]->{"term_vt"} // 0;
+    if ($vt == 0) { return; }
+
+    # Allow M-x editor commands from terminal mode (and slow ESC + key)
+    if ($key eq "M-x") {
+        cmd_mx();
+        return;
+    }
+    if ($key eq "ESC") {
+        # Wait briefly via wait_key? No: allow ESC prefix for M-x or send ESC + key to terminal!
+        set_msg("ESC- (x for M-x, ESC to send literal ESC)");
+        render();
+        my str $next = wait_key();
+        if ($next eq "x") {
+            cmd_mx();
+            return;
+        }
+        if ($next eq "ESC") {
+            Smacs::Term::send_bytes($vt, $E);
+            return;
+        }
+        if (length($next) == 1) {
+            Smacs::Term::send_bytes($vt, $E . $next);
+            return;
+        }
+        my str $mapped = term_key_to_bytes($vt, $next);
+        if (length($mapped) > 0) {
+            Smacs::Term::send_bytes($vt, $E . $mapped);
+        }
+        return;
+    }
+
+    # C-x prefix: escape hatch to all editor window/buffer/file commands
+    if ($key eq "C-x") {
+        set_msg("C-x- (o:win b:buf C-b:list d:dired [:copy y:paste C-x:send-C-x)");
+        render();
+        my str $cxk = wait_key();
+        if ($cxk eq "C-x") {
+            Smacs::Term::send_bytes($vt, core::pack("C", 24));
+            return;
+        }
+        if ($cxk eq "[") {
+            term_enter_copy_mode();
+            return;
+        }
+        if ($cxk eq "y") {
+            if (length($KILL) > 0) {
+                if (Smacs::Term::bracketed_paste_enabled($vt) == 1) {
+                    Smacs::Term::send_bytes($vt, $E . "[200~" . $KILL . $E . "[201~");
+                } else {
+                    Smacs::Term::send_bytes($vt, $KILL);
+                }
+            }
+            return;
+        }
+        handle_cx($cxk);
+        return;
+    }
+
+    if (Smacs::Term::is_alive($vt) == 0) {
+        if ($key eq "q" || $key eq "RET") {
+            cmd_kill_buffer();
+            return;
+        }
+        set_msg("Terminal process has exited (press q or C-x k to close, C-x [ to scroll/copy).");
+        return;
+    }
+
+    my str $raw = term_key_to_bytes($vt, $key);
+    if (length($raw) > 0) {
+        Smacs::Term::send_bytes($vt, $raw);
+        # Brief 2ms yield so fast echo (local typing / prompt) renders in the very same turn!
+        core::usleep(2000);
+        Smacs::Term::poll_output($vt);
+    }
+}
+
+func poll_all_terminals() int {
+    if (!defined($BUFFERS)) { return 0; }
+    my int $vis_changed = 0;
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        my scalar $b = $BUFFERS->[$bi];
+        my int $vt = $b->{"term_vt"} // 0;
+        if ($vt != 0) {
+            if (Smacs::Term::poll_output($vt) == 1) {
+                my int $wi = 0;
+                while ($wi < $WIN_COUNT) {
+                    if ($WINDOWS->[$wi]->{"buf_idx"} == $bi && ($b->{"mode"} // "") eq "Term") {
+                        $vis_changed = 1;
+                    }
+                    $wi = $wi + 1;
+                }
+            }
+        }
+        $bi = $bi + 1;
+    }
+    return $vis_changed;
+}
+
+func collect_watch_fds() scalar {
+    my scalar $fds = [0];
+    if (!defined($BUFFERS)) { return $fds; }
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        my int $vt = $BUFFERS->[$bi]->{"term_vt"} // 0;
+        if ($vt != 0) {
+            my int $mfd = Smacs::Term::master_fd($vt);
+            if ($mfd >= 0) {
+                push(@$fds, $mfd);
+            }
+        }
+        $bi = $bi + 1;
+    }
+    return $fds;
+}
+
+func cleanup_all_terminals() void {
+    if (!defined($BUFFERS)) { return; }
+    my int $bi = 0;
+    while ($bi < buf_count()) {
+        my int $vt = $BUFFERS->[$bi]->{"term_vt"} // 0;
+        if ($vt != 0) {
+            Smacs::Term::destroy($vt);
+            $BUFFERS->[$bi]->{"term_vt"} = 0;
+        }
+        $bi = $bi + 1;
+    }
 }
 
 # ===========================================================================
@@ -8144,6 +9443,12 @@ func handle_cx(str $key) void {
         cmd_write_file();
     } elsif ($key eq "C-f") {
         cmd_find_file();
+    } elsif ($key eq "d") {
+        cmd_dired();
+    } elsif ($key eq "C-j") {
+        cmd_dired_jump();
+    } elsif ($key eq "t") {
+        cmd_create_terminal();
     } elsif ($key eq "C-c") {
         cmd_quit_editor();
     } elsif ($key eq "b") {
@@ -8196,11 +9501,14 @@ func handle_cx(str $key) void {
 func describe_cx_key(str $ck) void {
     if ($ck eq "C-s") { set_msg("C-x C-s: save-buffer"); return; }
     if ($ck eq "C-w") { set_msg("C-x C-w: write-file (save as)"); return; }
-    if ($ck eq "C-f") { set_msg("C-x C-f: find-file"); return; }
+    if ($ck eq "C-f") { set_msg("C-x C-f: find-file (or directory in Dired)"); return; }
+    if ($ck eq "d") { set_msg("C-x d: dired (directory browser)"); return; }
+    if ($ck eq "C-j") { set_msg("C-x C-j: dired-jump (current file's directory)"); return; }
+    if ($ck eq "t") { set_msg("C-x t: create-terminal"); return; }
     if ($ck eq "C-c") { set_msg("C-x C-c: save-buffers-kill-terminal (quit)"); return; }
     if ($ck eq "b") { set_msg("C-x b: switch-buffer"); return; }
     if ($ck eq "k") { set_msg("C-x k: kill-buffer"); return; }
-    if ($ck eq "C-b") { set_msg("C-x C-b: list-buffers"); return; }
+    if ($ck eq "C-b") { set_msg("C-x C-b: list-buffers (*Buffers* menu)"); return; }
     if ($ck eq "RIGHT") { set_msg("C-x RIGHT: next-buffer"); return; }
     if ($ck eq "LEFT") { set_msg("C-x LEFT: previous-buffer"); return; }
     if ($ck eq "u") { set_msg("C-x u: undo"); return; }
@@ -8395,11 +9703,14 @@ func show_help_bindings() void {
     push(@$lines, "");
     push(@$lines, "Files & Buffers:");
     push(@$lines, "  C-x C-s        Save file");
-    push(@$lines, "  C-x C-f        Find (open) file");
+    push(@$lines, "  C-x C-f        Find file (or directory -> Dired)");
+    push(@$lines, "  C-x d          Dired directory browser");
+    push(@$lines, "  C-x C-j        Jump to current file in Dired");
     push(@$lines, "  C-x C-w        Write file (save as)");
     push(@$lines, "  C-x b          Switch buffer");
     push(@$lines, "  C-x k          Kill buffer");
-    push(@$lines, "  C-x C-b        List buffers");
+    push(@$lines, "  C-x C-b        Interactive buffer list (*Buffers*)");
+    push(@$lines, "  C-x t          Create terminal session buffer");
     push(@$lines, "  C-x RIGHT      Next buffer");
     push(@$lines, "  C-x LEFT       Previous buffer");
     push(@$lines, "  C-x ] / C-x [  Next / previous chunk (Large File Mode)");
@@ -8436,6 +9747,8 @@ func show_help_bindings() void {
     push(@$lines, "  large-next-chunk, large-prev-chunk,");
     push(@$lines, "  large-goto-offset, large-goto-percent,");
     push(@$lines, "  large-replace-all,");
+    push(@$lines, "  dired, dired-jump, buffer-menu,");
+    push(@$lines, "  create-terminal, term-copy-mode,");
     push(@$lines, "  hex-mode (toggle hex editor view),");
     push(@$lines, "  completion-mode, reload-completions");
 
@@ -8511,6 +9824,12 @@ func handle_key(str $key) void {
     # Hex mode takes over all key handling
     if ($HEX_MODE == 1) {
         hex_handle_key($key);
+        return;
+    }
+
+    # Live terminal session mode takes over key handling (C-x / M-x escape to editor)
+    if ($MODE eq "Term") {
+        term_handle_key($key);
         return;
     }
 
@@ -8607,6 +9926,50 @@ func handle_key(str $key) void {
         my str $next = wait_key();
         handle_cx($next);
         return;
+    }
+
+    # Interactive *Buffers* menu
+    if ($MODE eq "BufferMenu") {
+        if (bmenu_handle_key($key) == 1) { return; }
+        if ($key eq "PASTE" || $key eq "TAB" || $key eq "C-j" || $key eq "DEL" ||
+            $key eq "C-k" || $key eq "C-y" || $key eq "C-w" || $key eq "M-d" ||
+            $key eq "M-BACKSPACE" || $key eq "M-q" || $key eq "C-_" || $key eq "M-/" ||
+            $self_insert == 1) {
+            $PASTE_BUF = "";
+            set_msg("BufferMenu: RET:switch o:other-win s:save d:mark-del u:unmark x:execute g:refresh q:quit");
+            return;
+        }
+    }
+
+    # Interactive Dired directory browser
+    if ($MODE eq "Dired") {
+        if (dired_handle_key($key) == 1) { return; }
+        if ($key eq "PASTE" || $key eq "TAB" || $key eq "C-j" || $key eq "DEL" ||
+            $key eq "C-k" || $key eq "C-y" || $key eq "C-w" || $key eq "M-d" ||
+            $key eq "M-BACKSPACE" || $key eq "M-q" || $key eq "C-_" || $key eq "M-/" ||
+            $self_insert == 1) {
+            $PASTE_BUF = "";
+            set_msg("Dired: RET:open o:other-win ^:up +:mkdir R:rename C:copy d/x:delete .:dotfiles g:refresh q:quit");
+            return;
+        }
+    }
+
+    # Terminal Copy/Scroll mode
+    if ($MODE eq "Term-Copy") {
+        if ($key eq "q" || $key eq "i" || $key eq "RET") {
+            term_leave_copy_mode();
+            return;
+        }
+        if ($key eq " ") { move_page_down(); return; }
+        if ($key eq "BACKSPACE") { move_page_up(); return; }
+        if ($key eq "PASTE" || $key eq "TAB" || $key eq "C-j" || $key eq "C-d" ||
+            $key eq "DEL" || $key eq "C-k" || $key eq "C-y" || $key eq "C-w" ||
+            $key eq "M-d" || $key eq "M-BACKSPACE" || $key eq "M-q" ||
+            $key eq "C-_" || $key eq "M-/" || $self_insert == 1) {
+            $PASTE_BUF = "";
+            set_msg("Term-Copy is read-only (M-w to copy selection, q or i to resume live terminal).");
+            return;
+        }
     }
 
     # Read-only Help viewer shortcuts (*Help*, *About*)
@@ -9061,7 +10424,7 @@ func main() int {
         set_msg("smacs v" . Smacs::Commands::release_version() . " - C-x C-c to quit, C-h for help, M-x for commands");
     }
 
-    # Initial render; subsequent renders happen only on input or SIGWINCH
+    # Initial render; subsequent renders happen only on input, PTY output, or SIGWINCH
     render();
     while ($RUNNING == 1) {
         if ($EXIT_SIGNAL == 1) { $RUNNING = 0; last; }
@@ -9069,7 +10432,31 @@ func main() int {
             update_size();
             render();
         }
-        my str $key = read_key();
+        if (poll_all_terminals() == 1) {
+            render();
+        }
+        my str $key = "";
+        if (stdin_has_pending() == 1) {
+            $key = read_key();
+        } else {
+            my scalar $wfds = collect_watch_fds();
+            if (scalar(@$wfds) > 1) {
+                my scalar $rdy = core::select_fds($wfds, 200);
+                my int $stdin_ready = 0;
+                if (defined($rdy)) {
+                    my int $ri = 0;
+                    while ($ri < scalar(@$rdy)) {
+                        if ($rdy->[$ri] == 0) { $stdin_ready = 1; }
+                        $ri = $ri + 1;
+                    }
+                }
+                if ($stdin_ready == 1) {
+                    $key = read_key();
+                }
+            } else {
+                $key = read_key();
+            }
+        }
         if ($EXIT_SIGNAL == 1) { $RUNNING = 0; last; }
         if (length($key) > 0) {
             handle_key($key);
@@ -9079,6 +10466,7 @@ func main() int {
         }
     }
 
+    cleanup_all_terminals();
     disable_raw();
     return 0;
 }
